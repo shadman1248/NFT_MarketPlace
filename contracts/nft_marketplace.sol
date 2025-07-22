@@ -16,7 +16,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
     Counters.Counter private _bundleIds;
 
     uint256 public listingPrice = 0.025 ether;
-    uint256 public royaltyPercentage = 250; // 2.5% in basis points
+    uint256 public royaltyPercentage = 250; // 2.5%
 
     struct Collection {
         uint256 collectionId;
@@ -93,23 +93,33 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         bool accepted;
     }
 
+    struct Report {
+        uint256 tokenId;
+        address reporter;
+        string reason;
+        uint256 timestamp;
+    }
+
     mapping(uint256 => MarketItem) private idToMarketItem;
     mapping(uint256 => Auction) private idToAuction;
     mapping(uint256 => Offer[]) private tokenOffers;
-    mapping(address => bool) private verifiedCreators;
-    mapping(string => bool) private validCategories;
-    mapping(address => uint256) private creatorEarnings;
-
     mapping(uint256 => Collection) private idToCollection;
     mapping(uint256 => FractionalNFT) private idToFractionalNFT;
     mapping(uint256 => Rental) private idToRental;
     mapping(uint256 => Bundle) private idToBundle;
+
+    mapping(address => bool) private verifiedCreators;
+    mapping(string => bool) private validCategories;
+    mapping(address => uint256) private creatorEarnings;
     mapping(uint256 => mapping(address => bool)) private tokenLikes;
     mapping(address => uint256[]) private userFavorites;
     mapping(address => mapping(address => bool)) private userFollowing;
     mapping(address => address[]) private userFollowers;
     mapping(address => uint256) private userReputationScore;
+    mapping(address => uint256[]) private favoriteCollections;
+    mapping(uint256 => Report[]) private tokenReports;
 
+    // ========== Events ==========
     event MarketItemCreated(uint256 indexed tokenId, address seller, address owner, uint256 price, bool sold, string category);
     event MarketItemSold(uint256 indexed tokenId, address seller, address buyer, uint256 price);
     event AuctionCreated(uint256 indexed tokenId, uint256 startingPrice, uint256 auctionEnd);
@@ -119,7 +129,6 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
     event OfferAccepted(uint256 indexed tokenId, address buyer, uint256 amount);
     event CreatorVerified(address indexed creator);
     event RoyaltyPaid(address indexed creator, uint256 amount);
-
     event CollectionCreated(uint256 indexed collectionId, string name, address creator);
     event TokenAddedToCollection(uint256 indexed tokenId, uint256 indexed collectionId);
     event FractionalNFTCreated(uint256 indexed tokenId, uint256 totalShares, uint256 sharePrice);
@@ -130,6 +139,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
     event TokenLiked(uint256 indexed tokenId, address liker);
     event UserFollowed(address indexed follower, address indexed following);
     event ReputationBoosted(address indexed user, uint256 newScore);
+    event TokenReported(uint256 indexed tokenId, address indexed reporter, string reason);
 
     constructor() ERC721("NFT Marketplace", "NFTM") Ownable(msg.sender) {
         validCategories["Art"] = true;
@@ -145,20 +155,11 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         _;
     }
 
-    // Collection, Fractional, Rental, Bundle, Social, Discovery, Auction functions...
-    // (As included in your previous long code - unchanged)
-
-    // ✅ NEW FUNCTION: Boost Reputation on Successful Sale
-    function boostReputationOnSale(address user) internal {
-        userReputationScore[user] += 10;
-        emit ReputationBoosted(user, userReputationScore[user]);
-    }
-
-    // Example update (you can use boostReputationOnSale in your existing sale function like this):
+    // ========== Sale Function ==========
     function completeMarketSale(uint256 tokenId) public payable nonReentrant {
         MarketItem storage item = idToMarketItem[tokenId];
-        require(msg.value == item.price, "Please submit the asking price");
-        require(!item.sold, "Item already sold");
+        require(msg.value == item.price, "Submit the asking price");
+        require(!item.sold, "Already sold");
 
         item.owner = payable(msg.sender);
         item.sold = true;
@@ -168,12 +169,64 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         item.seller.transfer(msg.value);
 
         boostReputationOnSale(item.seller);
-
         emit MarketItemSold(tokenId, item.seller, msg.sender, item.price);
     }
 
-    // You can also add a public getter for reputation if needed:
+    // ========== Reputation System ==========
+    function boostReputationOnSale(address user) internal {
+        userReputationScore[user] += 10;
+        emit ReputationBoosted(user, userReputationScore[user]);
+    }
+
+    function boostReputationOnLike(address user) internal {
+        userReputationScore[user] += 2;
+        emit ReputationBoosted(user, userReputationScore[user]);
+    }
+
+    function boostReputationOnRental(address user) internal {
+        userReputationScore[user] += 5;
+        emit ReputationBoosted(user, userReputationScore[user]);
+    }
+
     function getUserReputation(address user) public view returns (uint256) {
         return userReputationScore[user];
+    }
+
+    function getUserBadge(address user) public view returns (string memory) {
+        uint256 score = userReputationScore[user];
+        if (score >= 200) return "Legendary";
+        else if (score >= 100) return "Expert";
+        else if (score >= 50) return "Intermediate";
+        else return "Newbie";
+    }
+
+    // ========== Report NFT ==========
+    function reportToken(uint256 tokenId, string memory reason) public {
+        require(_exists(tokenId), "Token doesn't exist");
+        tokenReports[tokenId].push(Report(tokenId, msg.sender, reason, block.timestamp));
+        emit TokenReported(tokenId, msg.sender, reason);
+    }
+
+    function getReportsForToken(uint256 tokenId) public view returns (Report[] memory) {
+        return tokenReports[tokenId];
+    }
+
+    // ========== Favorite Collection ==========
+    function favoriteCollection(uint256 collectionId) public {
+        favoriteCollections[msg.sender].push(collectionId);
+    }
+
+    function getFavoriteCollections(address user) public view returns (uint256[] memory) {
+        return favoriteCollections[user];
+    }
+
+    // ========== Admin & Utility ==========
+    function toggleCategory(string memory category, bool status) public onlyOwner {
+        validCategories[category] = status;
+    }
+
+    function toggleCreatorVerification(address creator, bool status) public onlyOwner {
+        verifiedCreators[creator] = status;
+        if (status) emit CreatorVerified(creator);
     }
 }

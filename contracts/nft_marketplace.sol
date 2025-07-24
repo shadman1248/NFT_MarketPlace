@@ -100,6 +100,12 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         uint256 timestamp;
     }
 
+    struct Comment {
+        address commenter;
+        string message;
+        uint256 timestamp;
+    }
+
     mapping(uint256 => MarketItem) private idToMarketItem;
     mapping(uint256 => Auction) private idToAuction;
     mapping(uint256 => Offer[]) private tokenOffers;
@@ -107,6 +113,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
     mapping(uint256 => FractionalNFT) private idToFractionalNFT;
     mapping(uint256 => Rental) private idToRental;
     mapping(uint256 => Bundle) private idToBundle;
+    mapping(uint256 => Comment[]) private tokenComments;
 
     mapping(address => bool) private verifiedCreators;
     mapping(string => bool) private validCategories;
@@ -140,6 +147,9 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
     event UserFollowed(address indexed follower, address indexed following);
     event ReputationBoosted(address indexed user, uint256 newScore);
     event TokenReported(uint256 indexed tokenId, address indexed reporter, string reason);
+    event NFTGifted(uint256 indexed tokenId, address from, address to);
+    event NFTBurned(uint256 indexed tokenId, address burner);
+    event TokenCommented(uint256 indexed tokenId, address commenter, string message);
 
     constructor() ERC721("NFT Marketplace", "NFTM") Ownable(msg.sender) {
         validCategories["Art"] = true;
@@ -155,7 +165,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         _;
     }
 
-    // ========== Sale Function ==========
+    // ========== Sale ==========
     function completeMarketSale(uint256 tokenId) public payable nonReentrant {
         MarketItem storage item = idToMarketItem[tokenId];
         require(msg.value == item.price, "Submit the asking price");
@@ -172,7 +182,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         emit MarketItemSold(tokenId, item.seller, msg.sender, item.price);
     }
 
-    // ========== Reputation System ==========
+    // ========== Reputation ==========
     function boostReputationOnSale(address user) internal {
         userReputationScore[user] += 10;
         emit ReputationBoosted(user, userReputationScore[user]);
@@ -200,7 +210,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         else return "Newbie";
     }
 
-    // ========== Report NFT ==========
+    // ========== Reporting ==========
     function reportToken(uint256 tokenId, string memory reason) public {
         require(_exists(tokenId), "Token doesn't exist");
         tokenReports[tokenId].push(Report(tokenId, msg.sender, reason, block.timestamp));
@@ -211,7 +221,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         return tokenReports[tokenId];
     }
 
-    // ========== Favorite Collection ==========
+    // ========== Favorites ==========
     function favoriteCollection(uint256 collectionId) public {
         favoriteCollections[msg.sender].push(collectionId);
     }
@@ -220,7 +230,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         return favoriteCollections[user];
     }
 
-    // ========== Admin & Utility ==========
+    // ========== Admin ==========
     function toggleCategory(string memory category, bool status) public onlyOwner {
         validCategories[category] = status;
     }
@@ -228,5 +238,30 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
     function toggleCreatorVerification(address creator, bool status) public onlyOwner {
         verifiedCreators[creator] = status;
         if (status) emit CreatorVerified(creator);
+    }
+
+    // ========== New: Gift NFT ==========
+    function giftNFT(uint256 tokenId, address recipient) public {
+        require(ownerOf(tokenId) == msg.sender, "Only owner can gift");
+        _transfer(msg.sender, recipient, tokenId);
+        emit NFTGifted(tokenId, msg.sender, recipient);
+    }
+
+    // ========== New: Burn NFT ==========
+    function burnNFT(uint256 tokenId) public {
+        require(ownerOf(tokenId) == msg.sender, "Only owner can burn");
+        _burn(tokenId);
+        emit NFTBurned(tokenId, msg.sender);
+    }
+
+    // ========== New: Comments ==========
+    function addComment(uint256 tokenId, string memory message) public {
+        require(_exists(tokenId), "Token doesn't exist");
+        tokenComments[tokenId].push(Comment(msg.sender, message, block.timestamp));
+        emit TokenCommented(tokenId, msg.sender, message);
+    }
+
+    function getComments(uint256 tokenId) public view returns (Comment[] memory) {
+        return tokenComments[tokenId];
     }
 }

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier:
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
@@ -8,15 +8,21 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 
-contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable {
+contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable, EIP712 {
     using Counters for Counters.Counter;
+    using ECDSA for bytes32;
+
     Counters.Counter private _tokenIds;
     Counters.Counter private _itemsSold;
     Counters.Counter private _collectionIds;
     Counters.Counter private _bundleIds;
     Counters.Counter private _subscriptionIds;
     Counters.Counter private _lotteryIds;
+    Counters.Counter private _affiliateIds;
+    Counters.Counter private _dropIds;
 
     uint256 public listingPrice = 0.025 ether;
     uint256 public royaltyPercentage = 250; // 2.5%
@@ -24,8 +30,13 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
     uint256 public minStakeAmount = 1 ether;
     uint256 public stakingRewardRate = 500; // 5% annually
     uint256 public constant SECONDS_PER_YEAR = 365 * 24 * 60 * 60;
+    uint256 public constant MAX_ROYALTY = 1000; // 10% max royalty
 
-    constructor() ERC721("NFT Marketplace", "NFTM") Ownable(msg.sender) {
+    // NEW: Domain separator for EIP-712
+    bytes32 private constant _LAZY_MINT_TYPEHASH = 
+        keccak256("LazyMintVoucher(uint256 tokenId,uint256 price,string uri,address creator,uint256 nonce,uint256 expiry)");
+
+    constructor() ERC721("NFT Marketplace", "NFTM") Ownable(msg.sender) EIP712("NFTMarketplace", "1") {
         validCategories["Art"] = true;
         validCategories["Music"] = true;
         validCategories["Photography"] = true;
@@ -51,6 +62,11 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         _;
     }
 
+    modifier notBanned() {
+        require(!bannedUsers[msg.sender], "User is banned");
+        _;
+    }
+
     // ========== Enhanced Structs ==========
     struct Collection { 
         uint256 collectionId; 
@@ -65,6 +81,9 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         uint256 totalVolume;
         bool isExclusive;
         uint256 royaltyPercentage;
+        bool isWhitelisted;
+        uint256 maxSupply;
+        uint256 currentSupply;
     }
 
     struct FractionalNFT { 
@@ -76,30 +95,10 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         bool isActive;
         uint256 dividendPool;
         mapping(address => uint256) lastDividendClaim;
-    }
-
-    struct Rental { 
-        uint256 tokenId; 
-        address renter; 
-        uint256 rentPrice; 
-        uint256 rentDuration; 
-        uint256 rentStart; 
-        uint256 rentEnd; 
-        bool isActive;
-        bool autoRenew;
-        uint256 totalEarned;
-    }
-
-    struct Bundle { 
-        uint256 bundleId; 
-        uint256[] tokenIds; 
-        uint256 bundlePrice; 
-        address seller; 
-        bool sold; 
-        uint256 createdAt; 
-        uint256 expiresAt;
-        uint256 discount;
-        string bundleName;
+        uint256 minimumBuyout;
+        bool buyoutInitiated;
+        address buyoutInitiator;
+        uint256 buyoutDeadline;
     }
 
     struct MarketItem { 
@@ -120,8 +119,12 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         uint256 unlockableContentHash;
         address[] collaborators;
         uint256[] collaboratorShares;
+        bool isLazyMinted;
+        uint256 editionNumber;
+        uint256 totalEditions;
     }
 
+    // NEW: Advanced Auction with multiple bid types
     struct Auction { 
         uint256 tokenId; 
         uint256 startingPrice; 
@@ -134,198 +137,173 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         bool isExtendable;
         uint256 bidIncrement;
         uint256 extensionTime;
+        AuctionType auctionType;
+        uint256 decrementAmount; // For Dutch auctions
+        uint256 decrementInterval; // For Dutch auctions
+        bool allowBuyNow;
+        uint256 buyNowPrice;
     }
 
-    struct Offer { 
-        uint256 tokenId; 
-        address buyer; 
-        uint256 amount; 
-        uint256 expiry; 
-        bool accepted;
-        IERC20 paymentToken;
-        bool isCollectionOffer;
-    }
+    enum AuctionType { English, Dutch, Sealed }
 
-    struct Report { 
-        uint256 tokenId; 
-        address reporter; 
-        string reason; 
-        uint256 timestamp;
-        bool resolved;
-        string resolution;
-    }
-
-    struct Comment { 
-        address commenter; 
-        string message; 
-        uint256 timestamp;
-        uint256 likes;
-        bool isVerified;
-    }
-
-    // ========== New Structs ==========
-    struct Subscription {
-        uint256 subscriptionId;
-        address subscriber;
+    // NEW: NFT Drop System
+    struct Drop {
+        uint256 dropId;
+        string name;
+        string description;
         address creator;
-        uint256 monthlyFee;
+        uint256 startTime;
+        uint256 endTime;
+        uint256 maxSupply;
+        uint256 currentSupply;
+        uint256 price;
+        uint256 maxPerWallet;
+        bool isWhitelistOnly;
+        mapping(address => bool) whitelist;
+        mapping(address => uint256) purchased;
+        string baseURI;
+        bool isActive;
+        uint256 revealTime;
+        bool isRevealed;
+    }
+
+    // NEW: Affiliate System
+    struct Affiliate {
+        uint256 affiliateId;
+        address affiliateAddress;
+        uint256 commissionRate; // Basis points (100 = 1%)
+        uint256 totalEarnings;
+        uint256 totalReferrals;
+        bool isActive;
+        uint256 tier; // 1: Bronze, 2: Silver, 3: Gold, 4: Platinum
+    }
+
+    // NEW: Dynamic Pricing
+    struct DynamicPricing {
+        uint256 tokenId;
+        uint256 basePrice;
+        uint256 currentPrice;
+        uint256 priceIncrement;
+        uint256 lastSaleTime;
+        uint256 demandMultiplier;
+        bool isActive;
+    }
+
+    // NEW: Cross-chain Bridge Support
+    struct BridgeRequest {
+        uint256 tokenId;
+        address owner;
+        uint256 targetChain;
+        string targetAddress;
+        uint256 timestamp;
+        bool completed;
+        bytes32 txHash;
+    }
+
+    // NEW: NFT Insurance
+    struct Insurance {
+        uint256 tokenId;
+        address insured;
+        uint256 coverageAmount;
+        uint256 premium;
         uint256 startTime;
         uint256 endTime;
         bool isActive;
-        uint256[] exclusiveTokens;
+        string[] coveredRisks;
     }
 
-    struct Lottery {
-        uint256 lotteryId;
-        uint256[] tokenIds;
-        uint256 ticketPrice;
-        uint256 maxTickets;
-        uint256 ticketsSold;
-        mapping(address => uint256) ticketsPurchased;
-        address[] participants;
-        uint256 endTime;
+    // NEW: Advanced Staking with multiple pools
+    struct StakingPool {
+        uint256 poolId;
+        string name;
+        uint256 rewardRate;
+        uint256 lockPeriod;
+        uint256 totalStaked;
+        uint256 maxStake;
         bool isActive;
-        address winner;
-        uint256 prizePool;
+        IERC20 rewardToken;
+        mapping(address => UserStake) userStakes;
     }
 
-    struct StakeInfo {
+    struct UserStake {
         uint256 amount;
         uint256 stakingTime;
         uint256 lastRewardClaim;
         uint256 totalRewards;
-    }
-
-    struct CreatorProfile {
-        string name;
-        string bio;
-        string avatar;
-        string website;
-        string[] socialLinks;
-        uint256 totalSales;
-        uint256 totalVolume;
-        uint256 followerCount;
-        bool isVerified;
-        uint256 verificationTier; // 1: Basic, 2: Premium, 3: Elite
-        uint256 createdAt;
-    }
-
-    struct LazyMintVoucher {
-        uint256 tokenId;
-        uint256 price;
-        string uri;
-        address creator;
-        bytes signature;
-        uint256 nonce;
-        uint256 expiry;
-    }
-
-    struct Loan {
-        uint256 tokenId;
-        address borrower;
-        address lender;
-        uint256 loanAmount;
-        uint256 interestRate;
-        uint256 duration;
-        uint256 startTime;
-        uint256 endTime;
-        bool isActive;
-        bool isDefaulted;
-        uint256 collateralValue;
+        uint256 lockEndTime;
     }
 
     // ========== Enhanced Mappings ==========
     mapping(uint256 => MarketItem) private idToMarketItem;
     mapping(uint256 => Auction) private idToAuction;
-    mapping(uint256 => Offer[]) private tokenOffers;
     mapping(uint256 => Collection) private idToCollection;
     mapping(uint256 => FractionalNFT) private idToFractionalNFT;
-    mapping(uint256 => Rental) private idToRental;
-    mapping(uint256 => Bundle) private idToBundle;
-    mapping(uint256 => Comment[]) private tokenComments;
-    mapping(uint256 => Subscription) private idToSubscription;
-    mapping(uint256 => Lottery) private idToLottery;
-    mapping(uint256 => Loan) private idToLoan;
+    mapping(uint256 => Drop) private idToDrop;
+    mapping(uint256 => Affiliate) private idToAffiliate;
+    mapping(uint256 => DynamicPricing) private idToDynamicPricing;
+    mapping(uint256 => BridgeRequest) private idToBridgeRequest;
+    mapping(uint256 => Insurance) private idToInsurance;
+    mapping(uint256 => StakingPool) private idToStakingPool;
 
     mapping(address => bool) private verifiedCreators;
     mapping(string => bool) private validCategories;
     mapping(address => uint256) private creatorEarnings;
-    mapping(uint256 => mapping(address => bool)) private tokenLikes;
-    mapping(address => uint256[]) private userFavorites;
-    mapping(address => mapping(address => bool)) private userFollowing;
-    mapping(address => address[]) private userFollowers;
-    mapping(address => uint256) private userReputationScore;
-    mapping(address => uint256[]) private favoriteCollections;
-    mapping(uint256 => Report[]) private tokenReports;
-
-    // ========== New Mappings ==========
-    mapping(address => StakeInfo) private userStakes;
-    mapping(address => CreatorProfile) private creatorProfiles;
-    mapping(address => uint256[]) private userSubscriptions;
-    mapping(address => uint256[]) private creatorSubscriptions;
-    mapping(address => mapping(uint256 => bool)) private hasAccessToCollection;
-    mapping(address => uint256) private userNonce;
-    mapping(address => bool) private whitelistedTokens; // For ERC20 payments
-    mapping(uint256 => string) private encryptedContent;
-    mapping(address => uint256) private lastActivityTime;
-    mapping(address => uint256) private tradingVolume;
-    mapping(uint256 => uint256) private tokenHistory; // Price history
     mapping(address => bool) private bannedUsers;
+    mapping(address => uint256) private userNonce;
+    mapping(address => address) private referrals; // user -> referrer
+    mapping(address => uint256[]) private userCollections;
+    mapping(uint256 => uint256[]) private collectionPriceHistory;
+    mapping(address => mapping(uint256 => bool)) private userVotedForCollection;
+
+    // NEW: Multi-signature wallet support
+    mapping(address => bool) private multisigWallets;
+    mapping(uint256 => mapping(address => bool)) private tokenApprovals; // token -> approver -> approved
+
+    // NEW: Governance
+    mapping(address => uint256) private votingPower;
+    mapping(uint256 => Proposal) private proposals;
+    mapping(uint256 => mapping(address => bool)) private hasVoted;
+    Counters.Counter private _proposalIds;
+
+    struct Proposal {
+        uint256 proposalId;
+        string description;
+        uint256 forVotes;
+        uint256 againstVotes;
+        uint256 startTime;
+        uint256 endTime;
+        bool executed;
+        ProposalType proposalType;
+        bytes data;
+    }
+
+    enum ProposalType { FeeChange, CategoryAdd, FeatureToggle, Emergency }
 
     // ========== Enhanced Events ==========
     event MarketItemCreated(uint256 indexed tokenId, address seller, address owner, uint256 price, bool sold, string category);
-    event MarketItemSold(uint256 indexed tokenId, address seller, address buyer, uint256 price);
-    event AuctionCreated(uint256 indexed tokenId, uint256 startingPrice, uint256 auctionEnd);
+    event MarketItemSold(uint256 indexed tokenId, address seller, address buyer, uint256 price, address indexed referrer);
+    event AuctionCreated(uint256 indexed tokenId, uint256 startingPrice, uint256 auctionEnd, AuctionType auctionType);
     event BidPlaced(uint256 indexed tokenId, address bidder, uint256 amount);
     event AuctionEnded(uint256 indexed tokenId, address winner, uint256 amount);
-    event AuctionFinalized(uint256 indexed tokenId, address winner, uint256 amount);
-    event OfferMade(uint256 indexed tokenId, address buyer, uint256 amount, uint256 expiry);
-    event OfferAccepted(uint256 indexed tokenId, address buyer, uint256 amount);
-    event CreatorVerified(address indexed creator);
-    event RoyaltyPaid(address indexed creator, uint256 amount);
-    event CollectionCreated(uint256 indexed collectionId, string name, address creator);
-    event TokenAddedToCollection(uint256 indexed tokenId, uint256 indexed collectionId);
-    event FractionalNFTCreated(uint256 indexed tokenId, uint256 totalShares, uint256 sharePrice);
-    event SharesPurchased(uint256 indexed tokenId, address buyer, uint256 shares, uint256 amount);
-    event ShareTransferred(uint256 indexed tokenId, address from, address to, uint256 shares);
-    event NFTRented(uint256 indexed tokenId, address renter, uint256 rentPrice, uint256 duration);
-    event BundleCreated(uint256 indexed bundleId, uint256[] tokenIds, uint256 bundlePrice);
-    event BundleSold(uint256 indexed bundleId, address buyer, uint256 price);
-    event TokenLiked(uint256 indexed tokenId, address liker);
-    event UserFollowed(address indexed follower, address indexed following);
-    event ReputationBoosted(address indexed user, uint256 newScore);
-    event TokenReported(uint256 indexed tokenId, address indexed reporter, string reason);
-    event NFTGifted(uint256 indexed tokenId, address from, address to);
-    event NFTBurned(uint256 indexed tokenId, address burner);
-    event TokenCommented(uint256 indexed tokenId, address commenter, string message);
-    event NFTBatchMinted(address indexed owner, uint256[] tokenIds);
+    event DropCreated(uint256 indexed dropId, string name, address creator, uint256 maxSupply);
+    event DropMinted(uint256 indexed dropId, address buyer, uint256 quantity, uint256 totalCost);
+    event AffiliateRegistered(uint256 indexed affiliateId, address affiliate, uint256 commissionRate);
+    event CommissionPaid(address indexed affiliate, uint256 amount, uint256 indexed tokenId);
+    event DynamicPriceUpdated(uint256 indexed tokenId, uint256 oldPrice, uint256 newPrice);
+    event BridgeRequested(uint256 indexed tokenId, address owner, uint256 targetChain);
+    event InsurancePurchased(uint256 indexed tokenId, address insured, uint256 coverageAmount);
+    event StakingPoolCreated(uint256 indexed poolId, string name, uint256 rewardRate);
+    event TokensStaked(address indexed user, uint256 indexed poolId, uint256 amount);
+    event RewardsClaimed(address indexed user, uint256 indexed poolId, uint256 amount);
+    event ProposalCreated(uint256 indexed proposalId, string description, ProposalType proposalType);
+    event ProposalExecuted(uint256 indexed proposalId);
+    event Voted(uint256 indexed proposalId, address voter, bool support, uint256 weight);
 
-    // ========== New Events ==========
-    event SubscriptionCreated(uint256 indexed subscriptionId, address subscriber, address creator, uint256 monthlyFee);
-    event SubscriptionRenewed(uint256 indexed subscriptionId, uint256 newEndTime);
-    event LotteryCreated(uint256 indexed lotteryId, uint256[] tokenIds, uint256 ticketPrice);
-    event LotteryTicketPurchased(uint256 indexed lotteryId, address buyer, uint256 tickets);
-    event LotteryEnded(uint256 indexed lotteryId, address winner, uint256 prizeAmount);
-    event TokenStaked(address indexed user, uint256 amount);
-    event TokenUnstaked(address indexed user, uint256 amount);
-    event RewardsClaimed(address indexed user, uint256 amount);
-    event CreatorProfileUpdated(address indexed creator, string name, string bio);
-    event LazyMinted(uint256 indexed tokenId, address indexed creator, address indexed buyer);
-    event LoanCreated(uint256 indexed tokenId, address borrower, address lender, uint256 amount);
-    event LoanRepaid(uint256 indexed tokenId, uint256 amount);
-    event LoanDefaulted(uint256 indexed tokenId);
-    event DividendDistributed(uint256 indexed tokenId, uint256 totalAmount);
-    event CollectionOfferMade(uint256 indexed collectionId, address buyer, uint256 amount);
-    event UserBanned(address indexed user, string reason);
-    event UserUnbanned(address indexed user);
-    event PriceAlertSet(uint256 indexed tokenId, address user, uint256 targetPrice);
-
-    // ========== Core Functions (Existing) ==========
+    // ========== Core Functions ==========
     
     function createToken(string memory tokenURI, uint256 price, string memory category) 
-        public payable nonReentrant onlyValidCategory(category) whenNotPaused {
+        public payable nonReentrant onlyValidCategory(category) whenNotPaused notBanned {
         require(msg.value == listingPrice, "Must pay listing price");
-        require(!bannedUsers[msg.sender], "User is banned");
         
         _tokenIds.increment();
         uint256 newTokenId = _tokenIds.current();
@@ -333,12 +311,6 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         _mint(msg.sender, newTokenId);
         _setTokenURI(newTokenId, tokenURI);
         createMarketItem(newTokenId, price, category);
-        
-        // Update creator profile
-        if (bytes(creatorProfiles[msg.sender].name).length == 0) {
-            creatorProfiles[msg.sender].createdAt = block.timestamp;
-        }
-        creatorProfiles[msg.sender].totalSales++;
         
         lastActivityTime[msg.sender] = block.timestamp;
     }
@@ -364,33 +336,51 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
             false,
             0,
             new address[](0),
-            new uint256[](0)
+            new uint256[](0),
+            false,
+            1,
+            1
         );
 
         _transfer(msg.sender, address(this), tokenId);
         emit MarketItemCreated(tokenId, msg.sender, address(this), price, false, category);
     }
 
-    function createMarketSale(uint256 tokenId) public payable nonReentrant whenNotPaused {
+    function buyToken(uint256 tokenId, address referrer) public payable nonReentrant whenNotPaused notBanned {
         uint256 price = idToMarketItem[tokenId].price;
         address seller = idToMarketItem[tokenId].seller;
         address creator = idToMarketItem[tokenId].creator;
         
         require(msg.value == price, "Submit asking price");
-        require(!bannedUsers[msg.sender], "User is banned");
         require(seller != msg.sender, "Cannot buy your own NFT");
 
-        // Calculate fees
+        // Handle dynamic pricing
+        if (idToDynamicPricing[tokenId].isActive) {
+            updateDynamicPrice(tokenId);
+        }
+
+        // Calculate fees including affiliate commission
+        uint256 affiliateCommission = 0;
+        if (referrer != address(0) && referrals[msg.sender] == address(0)) {
+            referrals[msg.sender] = referrer;
+            affiliateCommission = calculateAffiliateCommission(price, referrer);
+        }
+
         uint256 platformFeeAmount = (price * platformFee) / 10000;
         uint256 royaltyAmount = (price * royaltyPercentage) / 10000;
-        uint256 sellerAmount = price - platformFeeAmount - royaltyAmount;
+        uint256 sellerAmount = price - platformFeeAmount - royaltyAmount - affiliateCommission;
 
         // Transfer payments
         idToMarketItem[tokenId].seller.transfer(sellerAmount);
+        
         if (creator != seller) {
             payable(creator).transfer(royaltyAmount);
             creatorEarnings[creator] += royaltyAmount;
-            emit RoyaltyPaid(creator, royaltyAmount);
+        }
+
+        if (affiliateCommission > 0) {
+            payable(referrer).transfer(affiliateCommission);
+            emit CommissionPaid(referrer, affiliateCommission, tokenId);
         }
 
         _transfer(address(this), msg.sender, tokenId);
@@ -398,301 +388,380 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable 
         idToMarketItem[tokenId].sold = true;
         _itemsSold.increment();
 
-        // Update stats
-        tradingVolume[msg.sender] += price;
-        tradingVolume[seller] += price;
-        lastActivityTime[msg.sender] = block.timestamp;
-        lastActivityTime[seller] = block.timestamp;
-        
-        // Update collection stats if applicable
-        if (idToMarketItem[tokenId].collectionId > 0) {
-            uint256 collectionId = idToMarketItem[tokenId].collectionId;
-            idToCollection[collectionId].totalVolume += price;
-            if (price < idToCollection[collectionId].floorPrice || idToCollection[collectionId].floorPrice == 0) {
-                idToCollection[collectionId].floorPrice = price;
-            }
-        }
-
-        emit MarketItemSold(tokenId, seller, msg.sender, price);
+        emit MarketItemSold(tokenId, seller, msg.sender, price, referrer);
     }
 
-    // ========== Enhanced Auction System ==========
+    // ========== NEW: NFT Drop System ==========
     
-    function createAuction(uint256 tokenId, uint256 startingPrice, uint256 duration, uint256 reservePrice, bool isExtendable) 
-        public onlyTokenOwner(tokenId) whenNotPaused {
-        require(startingPrice > 0, "Starting price must be positive");
-        require(duration > 0, "Duration must be positive");
-        require(!bannedUsers[msg.sender], "User is banned");
+    function createDrop(
+        string memory name,
+        string memory description,
+        uint256 maxSupply,
+        uint256 price,
+        uint256 maxPerWallet,
+        uint256 startTime,
+        uint256 endTime,
+        string memory baseURI,
+        bool isWhitelistOnly
+    ) public onlyVerifiedCreator returns (uint256) {
+        require(maxSupply > 0, "Max supply must be positive");
+        require(price > 0, "Price must be positive");
+        require(endTime > startTime, "Invalid time range");
+        require(startTime > block.timestamp, "Start time must be future");
 
-        _transfer(msg.sender, address(this), tokenId);
+        _dropIds.increment();
+        uint256 dropId = _dropIds.current();
 
-        Auction storage auction = idToAuction[tokenId];
-        auction.tokenId = tokenId;
-        auction.startingPrice = startingPrice;
-        auction.auctionEnd = block.timestamp + duration;
-        auction.ended = false;
-        auction.reservePrice = reservePrice;
-        auction.isExtendable = isExtendable;
-        auction.bidIncrement = startingPrice / 20; // 5% minimum increment
-        auction.extensionTime = 600; // 10 minutes
+        Drop storage newDrop = idToDrop[dropId];
+        newDrop.dropId = dropId;
+        newDrop.name = name;
+        newDrop.description = description;
+        newDrop.creator = msg.sender;
+        newDrop.startTime = startTime;
+        newDrop.endTime = endTime;
+        newDrop.maxSupply = maxSupply;
+        newDrop.price = price;
+        newDrop.maxPerWallet = maxPerWallet;
+        newDrop.isWhitelistOnly = isWhitelistOnly;
+        newDrop.baseURI = baseURI;
+        newDrop.isActive = true;
 
-        idToMarketItem[tokenId].isAuction = true;
-        idToMarketItem[tokenId].price = startingPrice;
-
-        emit AuctionCreated(tokenId, startingPrice, auction.auctionEnd);
+        emit DropCreated(dropId, name, msg.sender, maxSupply);
+        return dropId;
     }
 
-    function placeBid(uint256 tokenId) public payable nonReentrant whenNotPaused {
-        Auction storage auction = idToAuction[tokenId];
-        require(block.timestamp < auction.auctionEnd, "Auction ended");
-        require(msg.value >= auction.startingPrice, "Bid below starting price");
-        require(msg.value >= auction.highestBid + auction.bidIncrement, "Bid increment too low");
-        require(!bannedUsers[msg.sender], "User is banned");
+    function mintFromDrop(uint256 dropId, uint256 quantity) public payable nonReentrant notBanned {
+        Drop storage drop = idToDrop[dropId];
+        require(drop.isActive, "Drop not active");
+        require(block.timestamp >= drop.startTime, "Drop not started");
+        require(block.timestamp <= drop.endTime, "Drop ended");
+        require(quantity > 0, "Quantity must be positive");
+        require(drop.currentSupply + quantity <= drop.maxSupply, "Exceeds max supply");
+        require(drop.purchased[msg.sender] + quantity <= drop.maxPerWallet, "Exceeds max per wallet");
 
-        // Extend auction if bid placed in last 10 minutes and extensible
-        if (auction.isExtendable && (auction.auctionEnd - block.timestamp) < auction.extensionTime) {
-            auction.auctionEnd += auction.extensionTime;
+        if (drop.isWhitelistOnly) {
+            require(drop.whitelist[msg.sender], "Not whitelisted");
         }
 
-        if (auction.highestBidder != address(0)) {
-            auction.pendingReturns[auction.highestBidder] += auction.highestBid;
-        }
+        uint256 totalCost = drop.price * quantity;
+        require(msg.value == totalCost, "Incorrect payment");
 
-        auction.highestBidder = msg.sender;
-        auction.highestBid = msg.value;
-
-        lastActivityTime[msg.sender] = block.timestamp;
-        emit BidPlaced(tokenId, msg.sender, msg.value);
-    }
-
-    function finalizeAuction(uint256 tokenId) public nonReentrant {
-        Auction storage auction = idToAuction[tokenId];
-        require(block.timestamp >= auction.auctionEnd, "Auction not ended");
-        require(!auction.ended, "Already finalized");
-        
-        auction.ended = true;
-
-        if (auction.highestBidder != address(0) && auction.highestBid >= auction.reservePrice) {
-            address payable seller = idToMarketItem[tokenId].seller;
-            address creator = idToMarketItem[tokenId].creator;
+        // Mint tokens
+        for (uint256 i = 0; i < quantity; i++) {
+            _tokenIds.increment();
+            uint256 tokenId = _tokenIds.current();
             
-            // Calculate fees
-            uint256 platformFeeAmount = (auction.highestBid * platformFee) / 10000;
-            uint256 royaltyAmount = (auction.highestBid * royaltyPercentage) / 10000;
-            uint256 sellerAmount = auction.highestBid - platformFeeAmount - royaltyAmount;
-
-            seller.transfer(sellerAmount);
-            if (creator != seller) {
-                payable(creator).transfer(royaltyAmount);
-                creatorEarnings[creator] += royaltyAmount;
-                emit RoyaltyPaid(creator, royaltyAmount);
-            }
-
-            _transfer(address(this), auction.highestBidder, tokenId);
-            idToMarketItem[tokenId].owner = payable(auction.highestBidder);
-            idToMarketItem[tokenId].sold = true;
-            _itemsSold.increment();
-
-            emit AuctionFinalized(tokenId, auction.highestBidder, auction.highestBid);
-        } else {
-            // Return NFT to seller if reserve not met
-            _transfer(address(this), idToMarketItem[tokenId].seller, tokenId);
-            idToMarketItem[tokenId].owner = idToMarketItem[tokenId].seller;
+            _mint(msg.sender, tokenId);
+            string memory tokenURI = string(abi.encodePacked(drop.baseURI, "/", toString(tokenId)));
+            _setTokenURI(tokenId, tokenURI);
             
-            // Return highest bid if any
-            if (auction.highestBidder != address(0)) {
-                auction.pendingReturns[auction.highestBidder] += auction.highestBid;
-            }
+            drop.currentSupply++;
         }
 
-        emit AuctionEnded(tokenId, auction.highestBidder, auction.highestBid);
-    }
-
-    function withdrawAuctionBid(uint256 tokenId) public nonReentrant {
-        Auction storage auction = idToAuction[tokenId];
-        uint256 amount = auction.pendingReturns[msg.sender];
-        require(amount > 0, "No funds to withdraw");
-        
-        auction.pendingReturns[msg.sender] = 0;
-        payable(msg.sender).transfer(amount);
-    }
-
-    // ========== Enhanced Rental System ==========
-    
-    function listForRent(uint256 tokenId, uint256 dailyPrice, bool autoRenew) public onlyTokenOwner(tokenId) {
-        require(dailyPrice > 0, "Price must be positive");
-        require(!isCurrentlyRented(tokenId), "Already rented");
-
-        Rental storage rental = idToRental[tokenId];
-        rental.tokenId = tokenId;
-        rental.rentPrice = dailyPrice;
-        rental.autoRenew = autoRenew;
-        rental.isActive = false; // Listed but not rented yet
-    }
-
-    function rentNFT(uint256 tokenId, uint256 durationInDays) public payable nonReentrant whenNotPaused {
-        Rental storage rent = idToRental[tokenId];
-        require(!isCurrentlyRented(tokenId), "Already rented");
-        require(ownerOf(tokenId) != msg.sender, "Owner can't rent");
-        require(durationInDays > 0, "Duration must be positive");
-        require(!bannedUsers[msg.sender], "User is banned");
-
-        uint256 totalCost = rent.rentPrice * durationInDays;
-        require(msg.value == totalCost, "Incorrect rent amount");
-
-        rent.renter = msg.sender;
-        rent.rentDuration = durationInDays * 1 days;
-        rent.rentStart = block.timestamp;
-        rent.rentEnd = block.timestamp + rent.rentDuration;
-        rent.isActive = true;
-        rent.totalEarned += msg.value;
-
-        // Pay owner (minus platform fee)
-        uint256 platformFeeAmount = (msg.value * platformFee) / 10000;
-        uint256 ownerAmount = msg.value - platformFeeAmount;
-        payable(ownerOf(tokenId)).transfer(ownerAmount);
-
-        boostReputationOnRental(msg.sender);
-        lastActivityTime[msg.sender] = block.timestamp;
-        
-        emit NFTRented(tokenId, msg.sender, msg.value, rent.rentDuration);
-    }
-
-    function isCurrentlyRented(uint256 tokenId) public view returns (bool) {
-        Rental memory rent = idToRental[tokenId];
-        return rent.isActive && block.timestamp < rent.rentEnd;
-    }
-
-    function extendRental(uint256 tokenId, uint256 additionalDays) public payable {
-        Rental storage rent = idToRental[tokenId];
-        require(rent.renter == msg.sender, "Not current renter");
-        require(isCurrentlyRented(tokenId), "Rental expired");
-        
-        uint256 extensionCost = rent.rentPrice * additionalDays;
-        require(msg.value == extensionCost, "Incorrect extension amount");
-
-        rent.rentEnd += additionalDays * 1 days;
-        rent.totalEarned += msg.value;
-
-        uint256 platformFeeAmount = (msg.value * platformFee) / 10000;
-        uint256 ownerAmount = msg.value - platformFeeAmount;
-        payable(ownerOf(tokenId)).transfer(ownerAmount);
-    }
-
-    // ========== NEW: Subscription System ==========
-    
-    function createSubscription(address creator, uint256 monthlyFee) public payable {
-        require(monthlyFee > 0, "Fee must be positive");
-        require(msg.value >= monthlyFee, "Insufficient payment");
-        require(creator != msg.sender, "Cannot subscribe to yourself");
-        require(verifiedCreators[creator], "Creator not verified");
-
-        _subscriptionIds.increment();
-        uint256 subscriptionId = _subscriptionIds.current();
-
-        idToSubscription[subscriptionId] = Subscription({
-            subscriptionId: subscriptionId,
-            subscriber: msg.sender,
-            creator: creator,
-            monthlyFee: monthlyFee,
-            startTime: block.timestamp,
-            endTime: block.timestamp + 30 days,
-            isActive: true,
-            exclusiveTokens: new uint256[](0)
-        });
-
-        userSubscriptions[msg.sender].push(subscriptionId);
-        creatorSubscriptions[creator].push(subscriptionId);
+        drop.purchased[msg.sender] += quantity;
 
         // Pay creator (minus platform fee)
-        uint256 platformFeeAmount = (monthlyFee * platformFee) / 10000;
-        uint256 creatorAmount = monthlyFee - platformFeeAmount;
-        payable(creator).transfer(creatorAmount);
+        uint256 platformFeeAmount = (totalCost * platformFee) / 10000;
+        uint256 creatorAmount = totalCost - platformFeeAmount;
+        payable(drop.creator).transfer(creatorAmount);
 
-        // Refund excess payment
-        if (msg.value > monthlyFee) {
-            payable(msg.sender).transfer(msg.value - monthlyFee);
-        }
-
-        emit SubscriptionCreated(subscriptionId, msg.sender, creator, monthlyFee);
+        emit DropMinted(dropId, msg.sender, quantity, totalCost);
     }
 
-    function renewSubscription(uint256 subscriptionId) public payable {
-        Subscription storage sub = idToSubscription[subscriptionId];
-        require(sub.subscriber == msg.sender, "Not subscriber");
-        require(msg.value >= sub.monthlyFee, "Insufficient payment");
-
-        sub.endTime = block.timestamp + 30 days;
-        sub.isActive = true;
-
-        uint256 platformFeeAmount = (sub.monthlyFee * platformFee) / 10000;
-        uint256 creatorAmount = sub.monthlyFee - platformFeeAmount;
-        payable(sub.creator).transfer(creatorAmount);
-
-        if (msg.value > sub.monthlyFee) {
-            payable(msg.sender).transfer(msg.value - sub.monthlyFee);
+    function addToWhitelist(uint256 dropId, address[] memory addresses) public {
+        Drop storage drop = idToDrop[dropId];
+        require(drop.creator == msg.sender, "Not drop creator");
+        
+        for (uint256 i = 0; i < addresses.length; i++) {
+            drop.whitelist[addresses[i]] = true;
         }
-
-        emit SubscriptionRenewed(subscriptionId, sub.endTime);
     }
 
-    function hasActiveSubscription(address subscriber, address creator) public view returns (bool) {
-        uint256[] memory subs = userSubscriptions[subscriber];
-        for (uint256 i = 0; i < subs.length; i++) {
-            Subscription memory sub = idToSubscription[subs[i]];
-            if (sub.creator == creator && sub.isActive && block.timestamp < sub.endTime) {
-                return true;
+    // ========== NEW: Affiliate System ==========
+    
+    function registerAffiliate(uint256 commissionRate) public returns (uint256) {
+        require(commissionRate <= 500, "Commission rate too high"); // Max 5%
+        require(commissionRate > 0, "Commission rate must be positive");
+
+        _affiliateIds.increment();
+        uint256 affiliateId = _affiliateIds.current();
+
+        idToAffiliate[affiliateId] = Affiliate({
+            affiliateId: affiliateId,
+            affiliateAddress: msg.sender,
+            commissionRate: commissionRate,
+            totalEarnings: 0,
+            totalReferrals: 0,
+            isActive: true,
+            tier: 1
+        });
+
+        emit AffiliateRegistered(affiliateId, msg.sender, commissionRate);
+        return affiliateId;
+    }
+
+    function calculateAffiliateCommission(uint256 salePrice, address affiliate) internal view returns (uint256) {
+        // Find affiliate by address
+        for (uint256 i = 1; i <= _affiliateIds.current(); i++) {
+            if (idToAffiliate[i].affiliateAddress == affiliate && idToAffiliate[i].isActive) {
+                return (salePrice * idToAffiliate[i].commissionRate) / 10000;
             }
         }
-        return false;
+        return 0;
     }
 
-    // ========== NEW: NFT Lottery System ==========
+    // ========== NEW: Dynamic Pricing ==========
     
-    function createLottery(uint256[] memory tokenIds, uint256 ticketPrice, uint256 maxTickets, uint256 duration) 
-        public whenNotPaused {
-        require(tokenIds.length > 0, "Must include tokens");
-        require(ticketPrice > 0, "Ticket price must be positive");
-        require(maxTickets > 0, "Max tickets must be positive");
-        require(duration > 0, "Duration must be positive");
+    function enableDynamicPricing(uint256 tokenId, uint256 basePrice, uint256 priceIncrement) public onlyTokenOwner(tokenId) {
+        require(basePrice > 0, "Base price must be positive");
+        require(priceIncrement > 0, "Price increment must be positive");
 
-        // Verify ownership of all tokens
-        for (uint256 i = 0; i < tokenIds.length; i++) {
-            require(ownerOf(tokenIds[i]) == msg.sender, "Not owner of token");
-            _transfer(msg.sender, address(this), tokenIds[i]);
-        }
+        idToDynamicPricing[tokenId] = DynamicPricing({
+            tokenId: tokenId,
+            basePrice: basePrice,
+            currentPrice: basePrice,
+            priceIncrement: priceIncrement,
+            lastSaleTime: 0,
+            demandMultiplier: 100, // 1x multiplier initially
+            isActive: true
+        });
 
-        _lotteryIds.increment();
-        uint256 lotteryId = _lotteryIds.current();
-
-        Lottery storage lottery = idToLottery[lotteryId];
-        lottery.lotteryId = lotteryId;
-        lottery.tokenIds = tokenIds;
-        lottery.ticketPrice = ticketPrice;
-        lottery.maxTickets = maxTickets;
-        lottery.endTime = block.timestamp + duration;
-        lottery.isActive = true;
-
-        emit LotteryCreated(lotteryId, tokenIds, ticketPrice);
+        idToMarketItem[tokenId].price = basePrice;
     }
 
-    function buyLotteryTickets(uint256 lotteryId, uint256 numTickets) public payable nonReentrant {
-        Lottery storage lottery = idToLottery[lotteryId];
-        require(lottery.isActive, "Lottery not active");
-        require(block.timestamp < lottery.endTime, "Lottery ended");
-        require(numTickets > 0, "Must buy at least one ticket");
-        require(lottery.ticketsSold + numTickets <= lottery.maxTickets, "Exceeds max tickets");
-        require(msg.value == lottery.ticketPrice * numTickets, "Incorrect payment");
+    function updateDynamicPrice(uint256 tokenId) internal {
+        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
+        if (!pricing.isActive) return;
 
-        if (lottery.ticketsPurchased[msg.sender] == 0) {
-            lottery.participants.push(msg.sender);
+        // Increase price based on demand and time since last sale
+        uint256 timeSinceLastSale = block.timestamp - pricing.lastSaleTime;
+        if (timeSinceLastSale < 1 hours) {
+            // High demand - increase price
+            pricing.currentPrice += pricing.priceIncrement;
+            pricing.demandMultiplier += 10; // Increase multiplier
+        } else if (timeSinceLastSale > 7 days) {
+            // Low demand - decrease price gradually
+            if (pricing.currentPrice > pricing.basePrice) {
+                pricing.currentPrice = (pricing.currentPrice * 95) / 100; // 5% decrease
+            }
         }
 
-        lottery.ticketsPurchased[msg.sender] += numTickets;
-        lottery.ticketsSold += numTickets;
-        lottery.prizePool += msg.value;
-
-        emit LotteryTicketPurchased(lotteryId, msg.sender, numTickets);
+        pricing.lastSaleTime = block.timestamp;
+        idToMarketItem[tokenId].price = pricing.currentPrice;
+        
+        emit DynamicPriceUpdated(tokenId, idToMarketItem[tokenId].price, pricing.currentPrice);
     }
 
-    function drawLottery(uint256 lotteryI
+    // ========== NEW: Advanced Staking Pools ==========
+    
+    function createStakingPool(
+        string memory name,
+        uint256 rewardRate,
+        uint256 lockPeriod,
+        uint256 maxStake,
+        address rewardTokenAddress
+    ) public onlyOwner returns (uint256) {
+        _stakingPoolIds.increment();
+        uint256 poolId = _stakingPoolIds.current();
+
+        StakingPool storage pool = idToStakingPool[poolId];
+        pool.poolId = poolId;
+        pool.name = name;
+        pool.rewardRate = rewardRate;
+        pool.lockPeriod = lockPeriod;
+        pool.maxStake = maxStake;
+        pool.isActive = true;
+        pool.rewardToken = IERC20(rewardTokenAddress);
+
+        emit StakingPoolCreated(poolId, name, rewardRate);
+        return poolId;
+    }
+
+    function stakeInPool(uint256 poolId) public payable nonReentrant {
+        StakingPool storage pool = idToStakingPool[poolId];
+        require(pool.isActive, "Pool not active");
+        require(msg.value > 0, "Must stake positive amount");
+        require(pool.totalStaked + msg.value <= pool.maxStake, "Exceeds pool max stake");
+
+        UserStake storage userStake = pool.userStakes[msg.sender];
+        
+        // Claim pending rewards before updating stake
+        if (userStake.amount > 0) {
+            claimStakingRewards(poolId);
+        }
+
+        userStake.amount += msg.value;
+        userStake.stakingTime = block.timestamp;
+        userStake.lockEndTime = block.timestamp + pool.lockPeriod;
+        userStake.lastRewardClaim = block.timestamp;
+        
+        pool.totalStaked += msg.value;
+
+        emit TokensStaked(msg.sender, poolId, msg.value);
+    }
+
+    function claimStakingRewards(uint256 poolId) public nonReentrant {
+        StakingPool storage pool = idToStakingPool[poolId];
+        UserStake storage userStake = pool.userStakes[msg.sender];
+        
+        require(userStake.amount > 0, "No stake found");
+        
+        uint256 timeStaked = block.timestamp - userStake.lastRewardClaim;
+        uint256 reward = (userStake.amount * pool.rewardRate * timeStaked) / (10000 * SECONDS_PER_YEAR);
+        
+        if (reward > 0) {
+            userStake.totalRewards += reward;
+            userStake.lastRewardClaim = block.timestamp;
+            
+            // Transfer reward tokens
+            require(pool.rewardToken.transfer(msg.sender, reward), "Reward transfer failed");
+            
+            emit RewardsClaimed(msg.sender, poolId, reward);
+        }
+    }
+
+    // ========== NEW: Cross-chain Bridge ==========
+    
+    function initiateBridge(uint256 tokenId, uint256 targetChain, string memory targetAddress) 
+        public onlyTokenOwner(tokenId) {
+        require(targetChain != block.chainid, "Cannot bridge to same chain");
+        require(bytes(targetAddress).length > 0, "Target address required");
+
+        // Lock the NFT
+        _transfer(msg.sender, address(this), tokenId);
+
+        uint256 requestId = _bridgeRequestIds.current();
+        idToBridgeRequest[requestId] = BridgeRequest({
+            tokenId: tokenId,
+            owner: msg.sender,
+            targetChain: targetChain,
+            targetAddress: targetAddress,
+            timestamp: block.timestamp,
+            completed: false,
+            txHash: bytes32(0)
+        });
+
+        emit BridgeRequested(tokenId, msg.sender, targetChain);
+    }
+
+    // ========== NEW: Governance System ==========
+    
+    function createProposal(
+        string memory description,
+        ProposalType proposalType,
+        bytes memory data
+    ) public returns (uint256) {
+        require(votingPower[msg.sender] >= 1000, "Insufficient voting power"); // Minimum 1000 tokens
+        
+        _proposalIds.increment();
+        uint256 proposalId = _proposalIds.current();
+
+        proposals[proposalId] = Proposal({
+            proposalId: proposalId,
+            description: description,
+            forVotes: 0,
+            againstVotes: 0,
+            startTime: block.timestamp,
+            endTime: block.timestamp + 7 days,
+            executed: false,
+            proposalType: proposalType,
+            data: data
+        });
+
+        emit ProposalCreated(proposalId, description, proposalType);
+        return proposalId;
+    }
+
+    function vote(uint256 proposalId, bool support) public {
+        Proposal storage proposal = proposals[proposalId];
+        require(block.timestamp <= proposal.endTime, "Voting ended");
+        require(!hasVoted[proposalId][msg.sender], "Already voted");
+        require(votingPower[msg.sender] > 0, "No voting power");
+
+        hasVoted[proposalId][msg.sender] = true;
+        uint256 weight = votingPower[msg.sender];
+
+        if (support) {
+            proposal.forVotes += weight;
+        } else {
+            proposal.againstVotes += weight;
+        }
+
+        emit Voted(proposalId, msg.sender, support, weight);
+    }
+
+    // ========== Utility Functions ==========
+    
+    function toString(uint256 value) internal pure returns (string memory) {
+        if (value == 0) {
+            return "0";
+        }
+        uint256 temp = value;
+        uint256 digits;
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
+        }
+        bytes memory buffer = new bytes(digits);
+        while (value != 0) {
+            digits -= 1;
+            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
+            value /= 10;
+        }
+        return string(buffer);
+    }
+
+    // ========== Admin Functions ==========
+    
+    function updatePlatformFee(uint256 newFee) public onlyOwner {
+        require(newFee <= 1000, "Fee too high"); // Max 10%
+        platformFee = newFee;
+    }
+
+    function banUser(address user, string memory reason) public onlyOwner {
+        bannedUsers[user] = true;
+        emit UserBanned(user, reason);
+    }
+
+    function unbanUser(address user) public onlyOwner {
+        bannedUsers[user] = false;
+        emit UserUnbanned(user);
+    }
+
+    function emergencyPause() public onlyOwner {
+        _pause();
+    }
+
+    function emergencyUnpause() public onlyOwner {
+        _unpause();
+    }
+
+    function withdrawPlatformFees() public onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No fees to withdraw");
+        payable(owner()).transfer(balance);
+    }
+
+    // ========== View Functions ==========
+    
+    function getMarketItem(uint256 tokenId) public view returns (MarketItem memory) {
+        return idToMarketItem[tokenId];
+    }
+
+    function getCollection(uint256 collectionId) public view returns (Collection memory) {
+        return idToCollection[collectionId];
+    }
+
+    function getDrop(uint256 dropId) public view returns (Drop memory drop) {
+        Drop storage storedDrop = idToDrop[dropId];
+        return Drop({
+            dropId: storedDrop.dropId,
+            name: storedDrop.name,
+            description: storedDrop.description,
+            creator: storedDrop.creator,
+            startTime: storedDrop.startTime,
+            endTime: storedDrop.endTime,
+            maxSupply: storedDrop.maxSupply,
+            currentSupply: storedDrop.currentSupply,
+            price: storedDrop.price,
+            max

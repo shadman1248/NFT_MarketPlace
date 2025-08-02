@@ -31,6 +31,9 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     Counters.Counter private _rentalIds;
     Counters.Counter private _loanIds;
     Counters.Counter private _escrowIds;
+    Counters.Counter private _analyticsIds;
+    Counters.Counter private _socialIds;
+    Counters.Counter private _gamificationIds;
 
     // ========== Constants ==========
     uint256 public listingPrice = 0.025 ether;
@@ -71,7 +74,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     }
 
     modifier onlyTokenOwner(uint256 tokenId) {
-        require(ownerOf(tokenId) == msg.sender, "Not token owner");
+        require(ownerOf(tokenId) == msg.sender || tokenApprovals[tokenId][msg.sender], "Not token owner or approved");
         _;
     }
 
@@ -87,6 +90,17 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
 
     modifier validTokenId(uint256 tokenId) {
         require(_exists(tokenId), "Token does not exist");
+        _;
+    }
+
+    modifier onlyAnalyst() {
+        require(marketAnalysts[msg.sender], "Not authorized analyst");
+        _;
+    }
+
+    modifier rateLimited(address user) {
+        require(block.timestamp >= lastActionTime[user] + actionCooldown, "Action rate limited");
+        lastActionTime[user] = block.timestamp;
         _;
     }
 
@@ -107,9 +121,23 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         bool isWhitelisted;
         uint256 maxSupply;
         uint256 currentSupply;
-        bytes32 merkleRoot; // For whitelist verification
+        bytes32 merkleRoot;
         bool isRevealed;
         string preRevealURI;
+        mapping(address => bool) collaborators;
+        mapping(address => uint256) collaboratorShares;
+        uint256 socialScore;
+        CollectionAnalytics analytics;
+    }
+
+    struct CollectionAnalytics {
+        uint256 totalViews;
+        uint256 uniqueVisitors;
+        uint256 averageHoldTime;
+        uint256 flipRate;
+        uint256 communityEngagement;
+        mapping(uint256 => uint256) dailyVolume; // timestamp => volume
+        mapping(address => uint256) topHolders;
     }
 
     struct FractionalNFT { 
@@ -127,6 +155,24 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         uint256 buyoutDeadline;
         uint256 sharesForSale;
         mapping(address => uint256) shareOffers;
+        GovernanceSettings governance;
+    }
+
+    struct GovernanceSettings {
+        uint256 votingPeriod;
+        uint256 quorumThreshold;
+        bool allowProposals;
+        mapping(uint256 => FractionalProposal) proposals;
+        uint256 proposalCount;
+    }
+
+    struct FractionalProposal {
+        string description;
+        uint256 forVotes;
+        uint256 againstVotes;
+        uint256 endTime;
+        bool executed;
+        mapping(address => bool) hasVoted;
     }
 
     struct MarketItem { 
@@ -153,6 +199,39 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         bool acceptsOffers;
         uint256 minOffer;
         PaymentMethod[] acceptedPayments;
+        TokenMetrics metrics;
+        SocialData socialData;
+        LegalData legalData;
+    }
+
+    struct TokenMetrics {
+        uint256 priceHistory;
+        uint256 volumeTraded;
+        uint256 numberOfSales;
+        uint256 averageHoldTime;
+        uint256 rarityScore;
+        uint256 liquidityScore;
+        mapping(uint256 => uint256) dailyPrices;
+    }
+
+    struct SocialData {
+        uint256 shares;
+        uint256 comments;
+        uint256 reactions;
+        mapping(address => bool) liked;
+        mapping(address => string) comments;
+        address[] commenters;
+        uint256 trendingScore;
+    }
+
+    struct LegalData {
+        string termsOfUse;
+        string licenseType;
+        bool isCommercialUse;
+        string[] restrictions;
+        address legalEntity;
+        string jurisdiction;
+        bool hasPhysicalRights;
     }
 
     struct Auction { 
@@ -177,6 +256,15 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         uint256 revealStart;
         uint256 revealEnd;
         bool bidsRevealed;
+        AuctionAnalytics analytics;
+    }
+
+    struct AuctionAnalytics {
+        uint256 totalBids;
+        uint256 uniqueBidders;
+        uint256 averageBid;
+        uint256 bidVolatility;
+        mapping(address => uint256) bidderActivity;
     }
 
     struct SealedBid {
@@ -211,16 +299,218 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         uint256 startPrice;
         uint256 endPrice;
         uint256 priceDecayRate;
+        DropAnalytics analytics;
+        DropSocial social;
     }
 
+    struct DropAnalytics {
+        uint256 totalParticipants;
+        uint256 conversionRate;
+        uint256 averagePurchase;
+        uint256 gasUsed;
+        mapping(uint256 => uint256) hourlyMints;
+    }
+
+    struct DropSocial {
+        uint256 hypeScore;
+        uint256 socialMentions;
+        uint256 communitySize;
+        mapping(address => bool) followers;
+        uint256 followerCount;
+    }
+
+    // ========== NEW: Advanced Analytics System ==========
+    struct MarketAnalytics {
+        uint256 analyticsId;
+        uint256 totalVolume24h;
+        uint256 totalVolume7d;
+        uint256 totalVolume30d;
+        uint256 averagePrice24h;
+        uint256 floorPrice;
+        uint256 ceilingPrice;
+        uint256 totalSales;
+        uint256 uniqueBuyers;
+        uint256 uniqueSellers;
+        mapping(string => uint256) categoryVolume;
+        mapping(address => uint256) topTraders;
+        mapping(uint256 => PricePoint) priceHistory;
+        uint256 priceHistoryCount;
+        TrendData trends;
+    }
+
+    struct PricePoint {
+        uint256 timestamp;
+        uint256 price;
+        uint256 volume;
+        string category;
+    }
+
+    struct TrendData {
+        int256 priceChange24h;
+        int256 volumeChange24h;
+        uint256 trendingTokens;
+        uint256 emergingCollections;
+        mapping(uint256 => uint256) categoryTrends;
+    }
+
+    // ========== NEW: Social Trading Features ==========
+    struct SocialTrading {
+        uint256 socialId;
+        address trader;
+        string username;
+        string bio;
+        string profileImage;
+        uint256 followerCount;
+        uint256 followingCount;
+        mapping(address => bool) followers;
+        mapping(address => bool) following;
+        TradingStats stats;
+        SocialMetrics metrics;
+        mapping(uint256 => TradePost) tradePosts;
+        uint256 postCount;
+        bool isInfluencer;
+        uint256 influencerTier;
+    }
+
+    struct TradingStats {
+        uint256 totalTrades;
+        uint256 profitableTrades;
+        uint256 totalProfit;
+        uint256 totalVolume;
+        uint256 averageHoldTime;
+        uint256 successRate;
+        uint256 reputation;
+        mapping(string => uint256) categoryExpertise;
+    }
+
+    struct SocialMetrics {
+        uint256 postLikes;
+        uint256 postShares;
+        uint256 commentCount;
+        uint256 engagementRate;
+        uint256 influenceScore;
+    }
+
+    struct TradePost {
+        uint256 postId;
+        address trader;
+        string content;
+        uint256 tokenId;
+        TradeAction action;
+        uint256 price;
+        uint256 timestamp;
+        uint256 likes;
+        uint256 shares;
+        mapping(address => bool) likedBy;
+        mapping(address => string) comments;
+        address[] commenters;
+        bool isSignal;
+        uint256 confidenceLevel;
+    }
+
+    enum TradeAction { Buy, Sell, Hold, Watch }
+
+    // ========== NEW: Gamification System ==========
+    struct GamificationSystem {
+        uint256 gamificationId;
+        mapping(address => UserLevel) userLevels;
+        mapping(address => Achievement[]) userAchievements;
+        mapping(address => uint256) userXP;
+        mapping(address => uint256) userStreaks;
+        mapping(uint256 => Quest) activeQuests;
+        uint256 questCount;
+        mapping(address => uint256[]) userQuests;
+        SeasonalEvent currentEvent;
+        mapping(address => Badge[]) userBadges;
+    }
+
+    struct UserLevel {
+        uint256 level;
+        uint256 xp;
+        uint256 xpToNext;
+        string title;
+        uint256[] unlockedFeatures;
+        uint256 multiplier;
+    }
+
+    struct Achievement {
+        uint256 achievementId;
+        string name;
+        string description;
+        uint256 xpReward;
+        bool unlocked;
+        uint256 unlockedAt;
+        AchievementType achievementType;
+    }
+
+    enum AchievementType { Trading, Social, Collection, Streak, Milestone }
+
+    struct Quest {
+        uint256 questId;
+        string name;
+        string description;
+        QuestType questType;
+        uint256 target;
+        uint256 reward;
+        uint256 xpReward;
+        uint256 startTime;
+        uint256 endTime;
+        bool isActive;
+        mapping(address => uint256) userProgress;
+        uint256 participants;
+    }
+
+    enum QuestType { Buy, Sell, List, Bid, Follow, Share, Comment }
+
+    struct SeasonalEvent {
+        string name;
+        uint256 startTime;
+        uint256 endTime;
+        uint256 bonusMultiplier;
+        mapping(address => uint256) eventXP;
+        uint256[] eventAchievements;
+        bool isActive;
+    }
+
+    struct Badge {
+        uint256 badgeId;
+        string name;
+        string image;
+        BadgeType badgeType;
+        uint256 earnedAt;
+    }
+
+    enum BadgeType { Trader, Collector, Creator, Social, Special }
+
+    // ========== NEW: Advanced AI Features ==========
+    struct AIRecommendation {
+        uint256 tokenId;
+        address user;
+        uint256 confidence;
+        string reason;
+        uint256 timestamp;
+        bool isPositive;
+        uint256 priceTarget;
+        uint256 timeframe;
+    }
+
+    struct PriceOracle {
+        mapping(uint256 => uint256) tokenPredictions;
+        mapping(string => uint256) categoryPredictions;
+        mapping(address => uint256) userRiskProfiles;
+        uint256 lastUpdate;
+        bool isActive;
+    }
+
+    // ========== Additional Structs (continuing from original) ==========
     struct Affiliate {
         uint256 affiliateId;
         address affiliateAddress;
-        uint256 commissionRate; // Basis points (100 = 1%)
+        uint256 commissionRate;
         uint256 totalEarnings;
         uint256 totalReferrals;
         bool isActive;
-        uint256 tier; // 1: Bronze, 2: Silver, 3: Gold, 4: Platinum
+        uint256 tier;
         uint256 minReferrals;
         uint256 bonusMultiplier;
     }
@@ -275,8 +565,8 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         bool isActive;
         IERC20 rewardToken;
         mapping(address => UserStake) userStakes;
-        uint256 penaltyRate; // Early withdrawal penalty
-        uint256 bonusMultiplier; // Long-term staking bonus
+        uint256 penaltyRate;
+        uint256 bonusMultiplier;
         uint256 minStakeAmount;
     }
 
@@ -307,7 +597,6 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
 
     enum ProposalType { FeeChange, CategoryAdd, FeatureToggle, Emergency, ParameterChange }
 
-    // ========== NEW: NFT Rental System ==========
     struct Rental {
         uint256 rentalId;
         uint256 tokenId;
@@ -331,7 +620,6 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         uint256 damageDeposit;
     }
 
-    // ========== NEW: NFT Loans ==========
     struct Loan {
         uint256 loanId;
         uint256 tokenId;
@@ -348,7 +636,6 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         bool isDefaulted;
     }
 
-    // ========== NEW: Escrow System ==========
     struct Escrow {
         uint256 escrowId;
         uint256 tokenId;
@@ -364,7 +651,6 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         address arbiter;
     }
 
-    // ========== NEW: Subscription NFTs ==========
     struct Subscription {
         uint256 subscriptionId;
         uint256 tokenId;
@@ -380,7 +666,6 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
 
     enum SubscriptionTier { Basic, Premium, VIP }
 
-    // ========== NEW: Bundle System ==========
     struct Bundle {
         uint256 bundleId;
         uint256[] tokenIds;
@@ -395,7 +680,6 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         string description;
     }
 
-    // ========== NEW: Lottery System ==========
     struct Lottery {
         uint256 lotteryId;
         uint256[] tokenIds;
@@ -411,17 +695,15 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         uint256 randomSeed;
     }
 
-    // ========== Payment Methods ==========
     enum PaymentMethod { ETH, ERC20, Crypto, Fiat }
 
     struct PaymentToken {
         address tokenAddress;
         bool isAccepted;
-        uint256 conversionRate; // Rate to ETH
+        uint256 conversionRate;
         uint8 decimals;
     }
 
-    // ========== Lazy Minting ==========
     struct LazyMintVoucher {
         uint256 tokenId;
         uint256 price;
@@ -451,13 +733,20 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     mapping(uint256 => Lottery) private idToLottery;
     mapping(uint256 => Proposal) private proposals;
 
+    // NEW: Enhanced mappings
+    mapping(uint256 => MarketAnalytics) private marketAnalytics;
+    mapping(uint256 => SocialTrading) private socialTrading;
+    mapping(uint256 => GamificationSystem) private gamificationSystems;
+    mapping(address => AIRecommendation[]) private userRecommendations;
+    mapping(address => PriceOracle) private priceOracles;
+
     // User mappings
     mapping(address => bool) private verifiedCreators;
     mapping(string => bool) private validCategories;
     mapping(address => uint256) private creatorEarnings;
     mapping(address => bool) private bannedUsers;
     mapping(address => uint256) private userNonce;
-    mapping(address => address) private referrals; // user -> referrer
+    mapping(address => address) private referrals;
     mapping(address => uint256[]) private userCollections;
     mapping(uint256 => uint256[]) private collectionPriceHistory;
     mapping(address => mapping(uint256 => bool)) private userVotedForCollection;
@@ -468,8 +757,22 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     mapping(address => uint256) private votingPower;
     mapping(uint256 => mapping(address => bool)) private hasVoted;
     mapping(address => PaymentToken) private acceptedPaymentTokens;
-    mapping(uint256 => mapping(address => uint256)) private tokenOffers; // tokenId -> buyer -> offer
+    mapping(uint256 => mapping(address => uint256)) private tokenOffers;
     mapping(address => uint256[]) private userWatchlist;
+
+    // NEW: Additional mappings
+    mapping(address => bool) private marketAnalysts;
+    mapping(address => uint256) private lastActionTime;
+    mapping(address => uint256[]) private userAIRecommendations;
+    mapping(string => uint256) private categoryPopularity;
+    mapping(address => mapping(address => bool)) private socialConnections;
+    mapping(uint256 => mapping(address => uint256)) private tokenEngagement;
+
+    // Configuration
+    uint256 public actionCooldown = 1 seconds;
+    bool public aiRecommendationsEnabled = true;
+    bool public socialTradingEnabled = true;
+    bool public gamificationEnabled = true;
 
     // ========== Enhanced Events ==========
     event MarketItemCreated(uint256 indexed tokenId, address seller, address owner, uint256 price, bool sold, string category);
@@ -509,242 +812,12 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     event OfferAccepted(uint256 indexed tokenId, address seller, address buyer, uint256 amount);
     event LazyMinted(uint256 indexed tokenId, address creator, address buyer, uint256 price);
 
-    // ========== Core Functions ==========
-    
-    function createToken(string memory tokenURI, uint256 price, string memory category) 
-        public payable nonReentrant onlyValidCategory(category) whenNotPaused notBanned {
-        require(msg.value == listingPrice, "Must pay listing price");
-        require(price > 0, "Price must be positive");
-        
-        _tokenIds.increment();
-        uint256 newTokenId = _tokenIds.current();
-
-        _mint(msg.sender, newTokenId);
-        _setTokenURI(newTokenId, tokenURI);
-        createMarketItem(newTokenId, price, category);
-        
-        lastActivityTime[msg.sender] = block.timestamp;
-    }
-
-    function createMarketItem(uint256 tokenId, uint256 price, string memory category) 
-        private onlyValidCategory(category) {
-        require(price > 0, "Price must be positive");
-
-        PaymentMethod[] memory defaultPayments = new PaymentMethod[](1);
-        defaultPayments[0] = PaymentMethod.ETH;
-
-        idToMarketItem[tokenId] = MarketItem(
-            tokenId,
-            payable(msg.sender),
-            payable(address(this)),
-            payable(msg.sender),
-            price,
-            block.timestamp,
-            0,
-            false,
-            false,
-            category,
-            0,
-            0,
-            0,
-            false,
-            0,
-            new address[](0),
-            new uint256[](0),
-            false,
-            1,
-            1,
-            true,
-            price / 10, // Min offer is 10% of price
-            defaultPayments
-        );
-
-        _transfer(msg.sender, address(this), tokenId);
-        emit MarketItemCreated(tokenId, msg.sender, address(this), price, false, category);
-    }
-
-    function buyToken(uint256 tokenId, address referrer) 
-        public payable nonReentrant whenNotPaused notBanned validTokenId(tokenId) {
-        MarketItem storage item = idToMarketItem[tokenId];
-        require(!item.sold, "Token already sold");
-        require(item.price > 0, "Token not for sale");
-        require(msg.value == item.price, "Incorrect payment amount");
-        require(item.seller != msg.sender, "Cannot buy your own NFT");
-
-        // Handle dynamic pricing
-        if (idToDynamicPricing[tokenId].isActive) {
-            updateDynamicPrice(tokenId);
-        }
-
-        // Calculate fees
-        uint256 affiliateCommission = 0;
-        if (referrer != address(0) && referrals[msg.sender] == address(0)) {
-            referrals[msg.sender] = referrer;
-            affiliateCommission = calculateAffiliateCommission(item.price, referrer);
-        }
-
-        uint256 platformFeeAmount = (item.price * platformFee) / 10000;
-        uint256 royaltyAmount = (item.price * royaltyPercentage) / 10000;
-        uint256 sellerAmount = item.price - platformFeeAmount - royaltyAmount - affiliateCommission;
-
-        // Handle collaborator payments
-        if (item.collaborators.length > 0) {
-            uint256 totalCollaboratorShare = 0;
-            for (uint256 i = 0; i < item.collaborators.length; i++) {
-                uint256 collaboratorAmount = (sellerAmount * item.collaboratorShares[i]) / 10000;
-                payable(item.collaborators[i]).transfer(collaboratorAmount);
-                totalCollaboratorShare += collaboratorAmount;
-            }
-            sellerAmount -= totalCollaboratorShare;
-        }
-
-        // Transfer payments
-        item.seller.transfer(sellerAmount);
-        
-        if (item.creator != item.seller) {
-            payable(item.creator).transfer(royaltyAmount);
-            creatorEarnings[item.creator] += royaltyAmount;
-        }
-
-        if (affiliateCommission > 0) {
-            payable(referrer).transfer(affiliateCommission);
-            updateAffiliateStats(referrer, affiliateCommission);
-            emit CommissionPaid(referrer, affiliateCommission, tokenId);
-        }
-
-        // Complete the sale
-        _transfer(address(this), msg.sender, tokenId);
-        item.owner = payable(msg.sender);
-        item.sold = true;
-        _itemsSold.increment();
-
-        // Update reputation
-        userReputation[msg.sender] += 1;
-        userReputation[item.seller] += 1;
-
-        emit MarketItemSold(tokenId, item.seller, msg.sender, item.price, referrer);
-    }
-
-    // ========== Lazy Minting ==========
-    
-    function lazyMint(LazyMintVoucher calldata voucher) 
-        public payable nonReentrant whenNotPaused notBanned {
-        require(voucher.expiry > block.timestamp, "Voucher expired");
-        require(msg.value == voucher.price, "Incorrect payment");
-        
-        // Verify signature
-        bytes32 structHash = keccak256(abi.encode(
-            _LAZY_MINT_TYPEHASH,
-            voucher.tokenId,
-            voucher.price,
-            keccak256(bytes(voucher.uri)),
-            voucher.creator,
-            voucher.nonce,
-            voucher.expiry
-        ));
-        
-        bytes32 hash = _hashTypedDataV4(structHash);
-        address signer = hash.recover(voucher.signature);
-        require(signer == voucher.creator, "Invalid signature");
-        require(userNonce[voucher.creator] == voucher.nonce, "Invalid nonce");
-        
-        // Mint the token
-        _mint(msg.sender, voucher.tokenId);
-        _setTokenURI(voucher.tokenId, voucher.uri);
-        
-        // Update nonce
-        userNonce[voucher.creator]++;
-        
-        // Pay creator (minus fees)
-        uint256 platformFeeAmount = (voucher.price * platformFee) / 10000;
-        uint256 creatorAmount = voucher.price - platformFeeAmount;
-        payable(voucher.creator).transfer(creatorAmount);
-        
-        emit LazyMinted(voucher.tokenId, voucher.creator, msg.sender, voucher.price);
-    }
-
-    // ========== Advanced Auction System ==========
-    
-    function createAuction(
-        uint256 tokenId,
-        uint256 startingPrice,
-        uint256 duration,
-        AuctionType auctionType,
-        uint256 reservePrice,
-        uint256 buyNowPrice
-    ) public onlyTokenOwner(tokenId) nonReentrant {
-        require(startingPrice > 0, "Starting price must be positive");
-        require(duration > 0, "Duration must be positive");
-        require(reservePrice >= startingPrice, "Invalid reserve price");
-
-        // Transfer token to contract
-        _transfer(msg.sender, address(this), tokenId);
-
-        Auction storage auction = idToAuction[tokenId];
-        auction.tokenId = tokenId;
-        auction.startingPrice = startingPrice;
-        auction.highestBid = 0;
-        auction.auctionEnd = block.timestamp + duration;
-        auction.ended = false;
-        auction.reservePrice = reservePrice;
-        auction.auctionType = auctionType;
-        auction.allowBuyNow = buyNowPrice > 0;
-        auction.buyNowPrice = buyNowPrice;
-
-        if (auctionType == AuctionType.Sealed) {
-            auction.revealStart = block.timestamp + (duration * 2) / 3;
-            auction.revealEnd = auction.auctionEnd;
-            auction.auctionEnd = auction.revealStart;
-        }
-
-        // Mark as auction in market item
-        idToMarketItem[tokenId].isAuction = true;
-
-        emit AuctionCreated(tokenId, startingPrice, auction.auctionEnd, auctionType);
-    }
-
-    function placeBid(uint256 tokenId) public payable nonReentrant notBanned {
-        Auction storage auction = idToAuction[tokenId];
-        require(!auction.ended, "Auction ended");
-        require(block.timestamp <= auction.auctionEnd, "Auction expired");
-        require(msg.value > auction.highestBid, "Bid too low");
-        require(msg.value >= auction.startingPrice, "Below starting price");
-
-        if (auction.auctionType == AuctionType.English) {
-            // Return previous highest bid
-            if (auction.highestBidder != address(0)) {
-                auction.pendingReturns[auction.highestBidder] += auction.highestBid;
-            }
-
-            auction.highestBid = msg.value;
-            auction.highestBidder = msg.sender;
-
-            // Extend auction if bid placed near end
-            if (auction.isExtendable && (auction.auctionEnd - block.timestamp) < 300) { // 5 minutes
-                auction.auctionEnd += auction.extensionTime;
-            }
-        }
-
-        emit BidPlaced(tokenId, msg.sender, msg.value);
-    }
-
-    function placeSealedBid(uint256 tokenId, bytes32 bidHash) public payable nonReentrant notBanned {
-        Auction storage auction = idToAuction[tokenId];
-        require(auction.auctionType == AuctionType.Sealed, "Not sealed auction");
-        require(!auction.ended, "Auction ended");
-        require(block.timestamp <= auction.auctionEnd, "Bidding period ended");
-        require(msg.value > 0, "Must send collateral");
-
-        auction.sealedBids[bidHash] = SealedBid({
-            bidder: msg.sender,
-            amount: msg.value,
-            revealed: false,
-            refunded: false
-        });
-
-        auction.bidHashes.push(bidHash);
-    }
-
-    function revealBid(uint256 tokenId, uint256 amount, uint256 nonce) public nonReentrant {
-        Auction storage auction = idToAuction[tokenId];
-        require(auction.auctionType == AuctionType.Sealed, "Not sealed auction
+    // NEW: Additional events
+    event AnalyticsUpdated(uint256 indexed analyticsId, uint256 volume24h, uint256 floorPrice);
+    event SocialConnectionMade(address indexed user1, address indexed user2, bool isFollowing);
+    event TradePostCreated(uint256 indexed postId, address indexed trader, uint256 indexed tokenId, TradeAction action);
+    event AchievementUnlocked(address indexed user, uint256 indexed achievementId, string name);
+    event QuestCompleted(address indexed user, uint256 indexed questId, uint256 xpReward);
+    event LevelUp(address indexed user, uint256 newLevel, string newTitle);
+    event AIRecommendationGenerated(uint256 indexed tokenId, address indexed user, uint256 confidence);
+    event TokenEngagement

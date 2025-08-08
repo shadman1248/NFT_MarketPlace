@@ -78,7 +78,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     bytes32 private constant _AI_PRICING_TYPEHASH =
         keccak256("AIPricingUpdate(uint256 tokenId,uint256 newPrice,uint256 confidence,uint256 timestamp,uint256 nonce)");
 
-    constructor() ERC721("NFT Marketplace", "NFTM") Ownable(msg.sender) EIP712("NFTMarketplace", "1") {
+    constructor() ERC721("NFT Marketplace", "NFTM") EIP712("NFTMarketplace", "1") {
         // Initialize valid categories
         validCategories["Art"] = true;
         validCategories["Music"] = true;
@@ -97,12 +97,14 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
 
         // NEW: Initialize AI Pricing Oracle
         aiPricingOracle = msg.sender; // Initially set to contract owner
+        authorizedAIOracles[msg.sender] = true;
         globalPricingEnabled = true;
         marketSentimentWeight = 3000; // 30%
         rarityWeight = 2500; // 25%
         volumeWeight = 2000; // 20%
         socialWeight = 1500; // 15%
         utilityWeight = 1000; // 10%
+        lastGlobalMarketUpdate = block.timestamp;
     }
 
     // ========== Modifiers ==========
@@ -154,7 +156,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
 
     // NEW: AI Pricing Modifiers
     modifier onlyAIPricingOracle() {
-        require(msg.sender == aiPricingOracle || msg.sender == owner(), "Not authorized for AI pricing");
+        require(msg.sender == aiPricingOracle || msg.sender == owner() || authorizedAIOracles[msg.sender], "Not authorized for AI pricing");
         _;
     }
 
@@ -166,10 +168,12 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         if (pricing.isActive) {
             uint256 currentPrice = pricing.currentAIPrice;
             uint256 maxChange = (currentPrice * MAX_PRICE_CHANGE_PER_UPDATE) / 10000;
-            require(
-                newPrice <= currentPrice + maxChange && newPrice >= currentPrice - maxChange,
-                "Price change exceeds maximum threshold"
-            );
+            if (currentPrice > 0) {
+                require(
+                    newPrice <= currentPrice + maxChange && newPrice >= currentPrice - maxChange,
+                    "Price change exceeds maximum threshold"
+                );
+            }
         }
         _;
     }
@@ -206,7 +210,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     }
 
     struct MarketFactors {
-        uint256 marketSentiment; // Bullish/Bearish indicator (-100 to 100)
+        int256 marketSentiment; // -100 .. 100
         uint256 collectionFloorPrice;
         uint256 collectionVolume24h;
         uint256 rarityRank;
@@ -514,6 +518,9 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     bool public carbonOffsetEnabled = true;
     bool public crossChainEnabled = true;
 
+    // Platform fee balance
+    uint256 private platformFeeBalance;
+
     // ========== NEW: Dynamic Pricing AI Events ==========
     event DynamicPricingEnabled(uint256 indexed tokenId, uint256 basePrice, PricingType strategy);
     event AIPriceUpdated(uint256 indexed tokenId, uint256 oldPrice, uint256 newPrice, uint256 confidence, string reason);
@@ -603,7 +610,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         require(pricing.isActive, "Dynamic pricing not active");
         require(block.timestamp >= pricing.lastUpdateTime + AI_PRICING_UPDATE_INTERVAL, "Update too frequent");
         
-        // Verify signature for price update
+        // Verify signature for price update (EIP-712)
         bytes32 hash = _hashTypedDataV4(keccak256(abi.encode(
             _AI_PRICING_TYPEHASH,
             tokenId,
@@ -617,10 +624,10 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         uint256 oldPrice = pricing.currentAIPrice;
         
         // Apply pricing rules and constraints
-        newPrice = _applyPricingConstraints(tokenId, newPrice, confidence);
+        uint256 constrainedPrice = _applyPricingConstraints(tokenId, newPrice, confidence);
         
         // Update pricing data
-        pricing.currentAIPrice = newPrice;
+        pricing.currentAIPrice = constrainedPrice;
         pricing.priceConfidence = confidence;
         pricing.lastUpdateTime = block.timestamp;
         pricing.totalUpdates++;
@@ -628,7 +635,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         // Add to price history
         pricing.priceHistory.push(PriceHistory({
             timestamp: block.timestamp,
-            price: newPrice,
+            price: constrainedPrice,
             confidence: confidence,
             reason: reason,
             marketVolume: _getCurrentMarketVolume(),
@@ -636,18 +643,18 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         }));
         
         // Update market item price
-        idToMarketItem[tokenId].price = newPrice;
+        idToMarketItem[tokenId].price = constrainedPrice;
         
         // Store hourly price data for analysis
         uint256 currentHour = block.timestamp / 3600;
-        tokenPriceByHour[tokenId][currentHour] = newPrice;
+        tokenPriceByHour[tokenId][currentHour] = constrainedPrice;
         
         // Update accuracy score if enough history
         if (pricing.totalUpdates > 10) {
             _updateAccuracyScore(tokenId);
         }
         
-        emit AIPriceUpdated(tokenId, oldPrice, newPrice, confidence, reason);
+        emit AIPriceUpdated(tokenId, oldPrice, constrainedPrice, confidence, reason);
     }
     
     /**
@@ -705,14 +712,14 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     /**
      * @dev Emergency stop for dynamic pricing
      */
-    function emergencyStopPricing(uint256 tokenId, string memory reason) external {
+    function emergencyStopPricing(uint256 tokenId, string memory reason) external nonReentrant {
         DynamicPricing storage pricing = idToDynamicPricing[tokenId];
         require(pricing.isActive, "Dynamic pricing not active");
         
         bool canStop = false;
         
         // Check if caller is authorized
-        if (msg.sender == ownerOf(tokenId) || msg.sender == owner() || msg.sender == aiPricingOracle) {
+        if (msg.sender == ownerOf(tokenId) || msg.sender == owner() || msg.sender == aiPricingOracle || authorizedAIOracles[msg.sender]) {
             canStop = true;
         } else {
             // Check if caller is in emergency stoppers list
@@ -727,4 +734,309 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         require(canStop, "Not authorized for emergency stop");
         
         pricing.isActive = false;
-        pricing
+        // Optionally freeze current price on market item
+        idToMarketItem[tokenId].hasDynamicPricing = false;
+        
+        emit EmergencyPricingStop(tokenId, msg.sender, reason);
+    }
+
+    // ========== NEW ADMIN / ORACLE MANAGEMENT ==========
+    function setAIPricingOracle(address newOracle) external onlyOwner {
+        require(newOracle != address(0), "Zero address");
+        address old = aiPricingOracle;
+        aiPricingOracle = newOracle;
+        authorizedAIOracles[newOracle] = true;
+        emit PricingOracleUpdated(old, newOracle);
+    }
+
+    function authorizeAIPricer(address who) external onlyOwner {
+        authorizedAIOracles[who] = true;
+    }
+
+    function revokeAIPricer(address who) external onlyOwner {
+        authorizedAIOracles[who] = false;
+    }
+
+    function toggleGlobalPricing(bool enabled) external onlyOwner {
+        globalPricingEnabled = enabled;
+    }
+
+    /**
+     * @dev Owner (token owner) can opt-out dynamic pricing and disable AI control over their token.
+     */
+    function ownerOptOutDynamicPricing(uint256 tokenId) external onlyTokenOwner(tokenId) {
+        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
+        require(pricing.isActive, "Not active");
+        pricing.isActive = false;
+        pricing.ownerOptedIn = false;
+        idToMarketItem[tokenId].hasDynamicPricing = false;
+    }
+
+    /**
+     * @dev Configure global weighting (e.g., weights used in internal scoring).
+     * values are basis points (sum should be <= 10000 but check isn't enforced here)
+     */
+    function configureGlobalWeights(uint256 _marketSentimentWeight, uint256 _rarityWeight, uint256 _volumeWeight, uint256 _socialWeight, uint256 _utilityWeight) external onlyOwner {
+        marketSentimentWeight = _marketSentimentWeight;
+        rarityWeight = _rarityWeight;
+        volumeWeight = _volumeWeight;
+        socialWeight = _socialWeight;
+        utilityWeight = _utilityWeight;
+    }
+
+    /**
+     * @dev Withdraw platform fees collected by the contract
+     */
+    function withdrawPlatformFees(address payable to) external onlyOwner nonReentrant {
+        require(to != address(0), "Zero addr");
+        uint256 amount = platformFeeBalance;
+        require(amount > 0, "No balance");
+        platformFeeBalance = 0;
+        (bool sent, ) = to.call{value: amount}("");
+        require(sent, "Withdraw failed");
+    }
+
+    // ========== GETTERS ==========
+    function getCurrentAIPrice(uint256 tokenId) external view returns (uint256 price, uint256 confidence, bool active) {
+        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
+        return (pricing.currentAIPrice, pricing.priceConfidence, pricing.isActive);
+    }
+
+    /**
+     * @dev Return price history arrays for a token's dynamic pricing
+     */
+    function getPriceHistory(uint256 tokenId) external view returns (uint256[] memory timestamps, uint256[] memory prices, uint256[] memory confidences, string[] memory reasons) {
+        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
+        uint256 len = pricing.priceHistory.length;
+        timestamps = new uint256[](len);
+        prices = new uint256[](len);
+        confidences = new uint256[](len);
+        reasons = new string[](len);
+
+        for (uint256 i = 0; i < len; i++) {
+            PriceHistory storage p = pricing.priceHistory[i];
+            timestamps[i] = p.timestamp;
+            prices[i] = p.price;
+            confidences[i] = p.confidence;
+            reasons[i] = p.reason;
+        }
+        return (timestamps, prices, confidences, reasons);
+    }
+
+    function getDynamicPricingInfo(uint256 tokenId) external view returns (
+        uint256 aiPricingId,
+        uint256 basePrice,
+        uint256 currentAIPrice,
+        uint256 lastUpdateTime,
+        uint256 priceConfidence,
+        bool isActive,
+        bool ownerOptedIn,
+        uint256 totalUpdates,
+        uint256 accuracyScore
+    ) {
+        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
+        return (
+            pricing.aiPricingId,
+            pricing.basePrice,
+            pricing.currentAIPrice,
+            pricing.lastUpdateTime,
+            pricing.priceConfidence,
+            pricing.isActive,
+            pricing.ownerOptedIn,
+            pricing.totalUpdates,
+            pricing.accuracyScore
+        );
+    }
+
+    // ========== INTERNAL / SIMPLE HELPERS (placeholders you can extend) ==========
+    function _applyPricingConstraints(uint256 tokenId, uint256 requestedPrice, uint256 confidence) internal view returns (uint256) {
+        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
+        uint256 result = requestedPrice;
+
+        // ensure confidence threshold
+        if (confidence < PRICING_CONFIDENCE_THRESHOLD) {
+            // Should be prevented by modifier, but safe-guard
+            revert("confidence too low");
+        }
+
+        // clamp change relative to current price if active
+        if (pricing.isActive && pricing.currentAIPrice > 0) {
+            uint256 current = pricing.currentAIPrice;
+            uint256 maxChange = (current * MAX_PRICE_CHANGE_PER_UPDATE) / 10000;
+            if (result > current + maxChange) {
+                result = current + maxChange;
+            }
+            if (result < current && current - result > maxChange) {
+                result = current - maxChange;
+            }
+        }
+
+        // minimal positive
+        if (result == 0) {
+            result = 1;
+        }
+
+        return result;
+    }
+
+    function _initializeMarketFactors(uint256 /* tokenId */) internal {
+        // Placeholder: in production, fetch collection floor, volume, social etc.
+        // For now do nothing.
+    }
+
+    function _getTargetVolatilityForStrategy(PricingType strategy) internal pure returns (uint256) {
+        if (strategy == PricingType.Conservative) return 500; // 5%
+        if (strategy == PricingType.Balanced) return 1000; // 10%
+        if (strategy == PricingType.Aggressive) return 2000; // 20%
+        if (strategy == PricingType.Momentum) return 1500;
+        if (strategy == PricingType.Contrarian) return 1200;
+        if (strategy == PricingType.ValueBased) return 800;
+        return 1000;
+    }
+
+    function _getResponsivenessForStrategy(PricingType strategy) internal pure returns (uint256) {
+        if (strategy == PricingType.Conservative) return 10;
+        if (strategy == PricingType.Balanced) return 50;
+        if (strategy == PricingType.Aggressive) return 90;
+        if (strategy == PricingType.Momentum) return 80;
+        if (strategy == PricingType.Contrarian) return 60;
+        if (strategy == PricingType.ValueBased) return 30;
+        return 50;
+    }
+
+    function _getTrendFollowingForStrategy(PricingType strategy) internal pure returns (uint256) {
+        if (strategy == PricingType.Momentum) return 90;
+        if (strategy == PricingType.Aggressive) return 70;
+        if (strategy == PricingType.Balanced) return 50;
+        return 20;
+    }
+
+    function _getCurrentMarketVolume() internal pure returns (uint256) {
+        // Placeholder: replace with real market volume source
+        return 0;
+    }
+
+    function _updateAccuracyScore(uint256 tokenId) internal {
+        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
+        // Placeholder: basic increment proportional to updates
+        pricing.accuracyScore = pricing.totalUpdates; // simplistic
+    }
+
+    function _calculateOverallMarketSentiment() internal view returns (uint256) {
+        // Placeholder: basic neutral sentiment
+        return 5000;
+    }
+
+    function _calculateNFTMarketTrend() internal view returns (uint256) {
+        return 5000;
+    }
+
+    function _calculatePredictedVolatility() internal view returns (uint256) {
+        return 1000;
+    }
+
+    function _updateCategoryTrends(uint256 /* analysisId */) internal {
+        // Placeholder
+    }
+
+    function _updateCollectionTrends(uint256 /* analysisId */) internal {
+        // Placeholder
+    }
+
+    function _generateMarketPredictions(uint256 /* analysisId */) internal {
+        // Placeholder
+    }
+
+    // ========== OVERRIDES / SAFETY ==========
+    function _beforeTokenTransfer(address from, address to, uint256 tokenId) internal override(ERC721) whenNotPaused {
+        super._beforeTokenTransfer(from, to, tokenId);
+    }
+
+    // Receive ETH (marketplace fees etc)
+    receive() external payable {
+        platformFeeBalance += msg.value;
+    }
+
+    fallback() external payable {
+        platformFeeBalance += msg.value;
+    }
+
+    // Example mint (very simple) - callers should implement proper minting, royalties, etc.
+    function simpleMint(string memory tokenURI) external returns (uint256) {
+        _tokenIds.increment();
+        uint256 newTokenId = _tokenIds.current();
+        _safeMint(msg.sender, newTokenId);
+        _setTokenURI(newTokenId, tokenURI);
+        // Setup default MarketItem
+        idToMarketItem[newTokenId] = MarketItem({
+            tokenId: newTokenId,
+            seller: payable(msg.sender),
+            owner: payable(msg.sender),
+            creator: payable(msg.sender),
+            price: 0,
+            createdAt: block.timestamp,
+            expiresAt: 0,
+            sold: false,
+            isAuction: false,
+            category: "",
+            collectionId: 0,
+            views: 0,
+            likes: 0,
+            isExclusive: false,
+            unlockableContentHash: 0,
+            collaborators: new address,
+            collaboratorShares: new uint256,
+            isLazyMinted: false,
+            editionNumber: 0,
+            totalEditions: 0,
+            acceptsOffers: false,
+            minOffer: 0,
+            isMetaverseEnabled: false,
+            isAIGenerated: false,
+            hasCarbonOffset: false,
+            isMusicNFT: false,
+            isRealEstate: false,
+            isFractional: false,
+            utilityScore: 0,
+            hasDynamicPricing: false,
+            aiPricingId: 0
+        });
+        return newTokenId;
+    }
+
+    // A simple helper to mark a creator as verified (owner only)
+    function setVerifiedCreator(address creator, bool verified) external onlyOwner {
+        verifiedCreators[creator] = verified;
+    }
+
+    // Pause / unpause
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    // Example emergency setter for platform fee (owner)
+    function setPlatformFee(uint256 feeBasisPoints) external onlyOwner {
+        platformFee = feeBasisPoints;
+    }
+
+    // Helper: allow token owner to enable an authorized updater for their token's dynamic pricing
+    function authorizeUpdaterForToken(uint256 tokenId, address updater) external onlyTokenOwner(tokenId) {
+        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
+        pricing.authorizedUpdaters[updater] = true;
+    }
+
+    function revokeUpdaterForToken(uint256 tokenId, address updater) external onlyTokenOwner(tokenId) {
+        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
+        pricing.authorizedUpdaters[updater] = false;
+    }
+
+    // Safety: check if address is authorized for given token (used externally if needed)
+    function isAuthorizedUpdater(uint256 tokenId, address who) external view returns (bool) {
+        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
+        return pricing.authorizedUpdaters[who];
+    }
+}

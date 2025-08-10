@@ -38,7 +38,14 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     Counters.Counter private _daoIds;
     Counters.Counter private _musicIds;
     Counters.Counter private _carbonIds;
-    Counters.Counter private _aiPricingIds; // NEW: Dynamic Pricing AI Counter
+    Counters.Counter private _aiPricingIds;
+    // NEW COUNTERS
+    Counters.Counter private _virtualGalleryIds;
+    Counters.Counter private _aiArtIds;
+    Counters.Counter private _subscriptionTierIds;
+    Counters.Counter private _loyaltyProgramIds;
+    Counters.Counter private _crossChainIds;
+    Counters.Counter private _gameAssetIds;
 
     // ========== Constants ==========
     uint256 public listingPrice = 0.025 ether;
@@ -57,12 +64,21 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     uint256 public constant CARBON_OFFSET_RATE = 100; // 1% for carbon offsetting
     uint256 public constant VR_SESSION_DURATION = 3600; // 1 hour in seconds
 
-    // NEW: Dynamic Pricing AI Constants
+    // Dynamic Pricing AI Constants
     uint256 public constant AI_PRICING_UPDATE_INTERVAL = 1 hours;
     uint256 public constant MIN_PRICE_CHANGE_THRESHOLD = 50; // 0.5% minimum change
     uint256 public constant MAX_PRICE_CHANGE_PER_UPDATE = 2000; // 20% maximum change per update
     uint256 public constant PRICING_CONFIDENCE_THRESHOLD = 7000; // 70% confidence minimum
     uint256 public constant MARKET_VOLATILITY_THRESHOLD = 1500; // 15% volatility threshold
+
+    // NEW CONSTANTS
+    uint256 public constant VIRTUAL_GALLERY_FEE = 0.005 ether;
+    uint256 public constant AI_GENERATION_FEE = 0.02 ether;
+    uint256 public constant PREMIUM_SUBSCRIPTION_FEE = 0.1 ether;
+    uint256 public constant CROSS_CHAIN_FEE = 0.01 ether;
+    uint256 public constant MAX_AI_GENERATIONS_PER_DAY = 10;
+    uint256 public constant LOYALTY_TIER_UPGRADE_THRESHOLD = 1000; // Points needed
+    uint256 public constant SUBSCRIPTION_DURATION = 30 days;
 
     // ========== EIP-712 Type Hashes ==========
     bytes32 private constant _LAZY_MINT_TYPEHASH = 
@@ -74,9 +90,15 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     bytes32 private constant _METAVERSE_TYPEHASH =
         keccak256("MetaverseAccess(address user,uint256 tokenId,uint256 duration,uint256 nonce,uint256 expiry)");
 
-    // NEW: Dynamic Pricing AI Type Hash
     bytes32 private constant _AI_PRICING_TYPEHASH =
         keccak256("AIPricingUpdate(uint256 tokenId,uint256 newPrice,uint256 confidence,uint256 timestamp,uint256 nonce)");
+
+    // NEW TYPE HASHES
+    bytes32 private constant _CROSS_CHAIN_TYPEHASH =
+        keccak256("CrossChainTransfer(uint256 tokenId,uint256 targetChain,address targetAddress,uint256 nonce,uint256 expiry)");
+
+    bytes32 private constant _AI_GENERATION_TYPEHASH =
+        keccak256("AIGeneration(address user,string prompt,string style,uint256 nonce,uint256 expiry)");
 
     constructor() ERC721("NFT Marketplace", "NFTM") EIP712("NFTMarketplace", "1") {
         // Initialize valid categories
@@ -94,9 +116,11 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         validCategories["Sustainability"] = true;
         validCategories["Education"] = true;
         validCategories["Health"] = true;
+        validCategories["VirtualGallery"] = true; // NEW
+        validCategories["GameAsset"] = true; // NEW
 
-        // NEW: Initialize AI Pricing Oracle
-        aiPricingOracle = msg.sender; // Initially set to contract owner
+        // Initialize AI Pricing Oracle
+        aiPricingOracle = msg.sender;
         authorizedAIOracles[msg.sender] = true;
         globalPricingEnabled = true;
         marketSentimentWeight = 3000; // 30%
@@ -105,6 +129,22 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         socialWeight = 1500; // 15%
         utilityWeight = 1000; // 10%
         lastGlobalMarketUpdate = block.timestamp;
+
+        // NEW: Initialize default loyalty program
+        _createDefaultLoyaltyProgram();
+        
+        // NEW: Initialize supported chains
+        supportedChains[1] = true; // Ethereum
+        supportedChains[137] = true; // Polygon
+        supportedChains[56] = true; // BSC
+        supportedChains[43114] = true; // Avalanche
+        
+        // NEW: Initialize AI art styles
+        supportedAIStyles["Realistic"] = true;
+        supportedAIStyles["Abstract"] = true;
+        supportedAIStyles["Impressionist"] = true;
+        supportedAIStyles["Cyberpunk"] = true;
+        supportedAIStyles["Fantasy"] = true;
     }
 
     // ========== Modifiers ==========
@@ -154,7 +194,6 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         _;
     }
 
-    // NEW: AI Pricing Modifiers
     modifier onlyAIPricingOracle() {
         require(msg.sender == aiPricingOracle || msg.sender == owner() || authorizedAIOracles[msg.sender], "Not authorized for AI pricing");
         _;
@@ -178,8 +217,247 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         _;
     }
 
-    // ========== NEW: Dynamic Pricing AI Structs ==========
+    // NEW MODIFIERS
+    modifier onlyPremiumSubscriber() {
+        require(userSubscriptions[msg.sender].isActive && userSubscriptions[msg.sender].tier >= SubscriptionTier.Premium, "Premium subscription required");
+        _;
+    }
+
+    modifier onlyGalleryOwner(uint256 galleryId) {
+        require(idToVirtualGallery[galleryId].owner == msg.sender, "Not gallery owner");
+        _;
+    }
+
+    modifier validAIGenerationRequest(string memory prompt, string memory style) {
+        require(bytes(prompt).length > 0 && bytes(prompt).length <= 1000, "Invalid prompt length");
+        require(supportedAIStyles[style], "Unsupported AI style");
+        require(userAIGenerations[msg.sender][today()] < MAX_AI_GENERATIONS_PER_DAY, "Daily AI generation limit exceeded");
+        _;
+    }
+
+    modifier onlySupportedChain(uint256 chainId) {
+        require(supportedChains[chainId], "Unsupported chain");
+        _;
+    }
+
+    // ========== NEW STRUCTS ==========
+
+    struct VirtualGallery {
+        uint256 galleryId;
+        string name;
+        string description;
+        address owner;
+        uint256 createdAt;
+        uint256[] exhibitedTokenIds;
+        GalleryTheme theme;
+        GallerySettings settings;
+        mapping(address => bool) curators;
+        mapping(address => uint256) visitHistory;
+        uint256 totalVisits;
+        uint256 entryFee;
+        bool isPublic;
+        string metaverseLocation;
+        VRExperience vrExperience;
+        mapping(uint256 => ExhibitInfo) exhibits;
+        uint256 maxCapacity;
+        bool isLive; // For live events
+        uint256 nextEventTime;
+        mapping(address => bool) vipAccess;
+    }
+
+    struct GalleryTheme {
+        string backgroundColor;
+        string wallTexture;
+        string floorTexture;
+        string lightingMode;
+        string musicPlaylist;
+        bool enableParticleEffects;
+        string customShaders;
+    }
+
+    struct GallerySettings {
+        bool allowComments;
+        bool allowLikes;
+        bool allowSharing;
+        bool enableAnalytics;
+        bool moderateContent;
+        uint256 maxVisitorsPerSession;
+        bool requireRegistration;
+        string[] bannedWords;
+    }
+
+    struct ExhibitInfo {
+        uint256 tokenId;
+        Vector3 position;
+        Vector3 scale;
+        string description;
+        string audioGuide;
+        bool isInteractive;
+        mapping(address => string) visitorComments;
+        uint256 viewCount;
+        uint256 interactionCount;
+    }
+
+    struct VRExperience {
+        bool isVREnabled;
+        string vrWorldId;
+        Vector3 spawnPoint;
+        string[] availableAvatars;
+        bool enableVoiceChat;
+        bool enableHandTracking;
+        string vrPlatform;
+        uint256 maxVRUsers;
+    }
+
+    struct AIArtGeneration {
+        uint256 aiArtId;
+        address requester;
+        string prompt;
+        string style;
+        string negativePrompt;
+        uint256 seed;
+        uint256 steps;
+        string model;
+        uint256 requestedAt;
+        uint256 completedAt;
+        string resultURI;
+        bool isCompleted;
+        bool isMinted;
+        uint256 generationCost;
+        AIParameters parameters;
+        mapping(address => bool) collaborativeVotes;
+        uint256 qualityScore;
+        bool isPublic;
+    }
+
+    struct AIParameters {
+        uint256 width;
+        uint256 height;
+        uint256 cfgScale;
+        string sampler;
+        bool enableUpscaling;
+        uint256 upscaleFactor;
+        bool enableFaceRestore;
+        string additionalPrompts;
+        bool enableStyleTransfer;
+        string referenceImageURI;
+    }
+
+    struct SubscriptionTier {
+        uint256 tierId;
+        string name;
+        uint256 monthlyFee;
+        uint256 discountPercentage;
+        uint256 maxListings;
+        uint256 maxAIGenerations;
+        bool enablePrioritySupport;
+        bool enableAnalytics;
+        bool enableCustomGalleries;
+        bool enableCrossChain;
+        bool enableBulkOperations;
+        string[] additionalFeatures;
+        uint256 loyaltyMultiplier;
+    }
+
+    struct UserSubscription {
+        uint256 tierId;
+        SubscriptionTier tier;
+        uint256 startTime;
+        uint256 endTime;
+        bool isActive;
+        bool autoRenew;
+        uint256 totalSpent;
+        mapping(string => bool) usedFeatures;
+        uint256 featureUsageCount;
+    }
+
+    struct LoyaltyProgram {
+        uint256 programId;
+        string name;
+        mapping(address => LoyaltyMember) members;
+        LoyaltyTier[] tiers;
+        mapping(string => LoyaltyReward) rewards;
+        bool isActive;
+        uint256 totalMembers;
+        uint256 pointsToEtherRate;
+    }
+
+    struct LoyaltyMember {
+        address memberAddress;
+        uint256 totalPoints;
+        uint256 currentTier;
+        uint256 joinedAt;
+        uint256 lastActivityAt;
+        mapping(string => uint256) earnedRewards;
+        uint256 lifetimeSpent;
+        uint256 referralCount;
+        bool isActive;
+    }
+
+    struct LoyaltyTier {
+        string name;
+        uint256 pointsRequired;
+        uint256 discountPercentage;
+        string[] benefits;
+        string badgeURI;
+        uint256 monthlyTokenAllowance;
+    }
+
+    struct LoyaltyReward {
+        string name;
+        uint256 pointsCost;
+        string description;
+        bool isActive;
+        uint256 maxClaims;
+        uint256 claimedCount;
+        string rewardType; // "DISCOUNT", "NFT", "ACCESS", "PHYSICAL"
+        bytes rewardData;
+    }
+
+    struct CrossChainBridge {
+        uint256 bridgeId;
+        uint256 tokenId;
+        uint256 sourceChain;
+        uint256 targetChain;
+        address sourceOwner;
+        address targetAddress;
+        uint256 bridgeFee;
+        BridgeStatus status;
+        uint256 requestedAt;
+        uint256 processedAt;
+        string txHashSource;
+        string txHashTarget;
+        bytes32 merkleProof;
+        bool isEmergencyWithdrawable;
+    }
+
+    enum BridgeStatus { Pending, InProgress, Completed, Failed, Cancelled }
+
+    struct GameAssetIntegration {
+        uint256 assetId;
+        uint256 tokenId;
+        string gameId;
+        string assetType;
+        mapping(string => uint256) gameStats;
+        mapping(string => bool) gameFeatures;
+        uint256 powerLevel;
+        uint256 rarity;
+        bool isTransferable;
+        bool isUpgradeable;
+        uint256 experiencePoints;
+        mapping(address => uint256) playerUsage;
+        string[] compatibleGames;
+        bytes gameData;
+    }
+
+    // ========== EXISTING STRUCTS (Condensed) ==========
     
+    struct Vector3 {
+        int256 x;
+        int256 y;
+        int256 z;
+    }
+
     struct DynamicPricing {
         uint256 aiPricingId;
         uint256 tokenId;
@@ -200,17 +478,17 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
 
     struct PricingStrategy {
         PricingType pricingType;
-        uint256 targetVolatility; // Basis points
-        uint256 responsiveness; // How quickly to react to market changes (1-100)
-        uint256 trendFollowing; // Percentage to follow market trends (0-100)
+        uint256 targetVolatility;
+        uint256 responsiveness;
+        uint256 trendFollowing;
         bool enableFloorProtection;
-        uint256 floorPriceMultiplier; // Minimum price as % of floor price
+        uint256 floorPriceMultiplier;
         bool enableCeilingCap;
-        uint256 ceilingPriceMultiplier; // Maximum price as % of collection ceiling
+        uint256 ceilingPriceMultiplier;
     }
 
     struct MarketFactors {
-        int256 marketSentiment; // -100 .. 100
+        int256 marketSentiment;
         uint256 collectionFloorPrice;
         uint256 collectionVolume24h;
         uint256 rarityRank;
@@ -220,25 +498,25 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         uint256 marketCapTrend;
         uint256 competitorPricing;
         uint256 seasonalityFactor;
-        uint256 newsPressureScore; // Impact of news/events
-        uint256 whaleActivityScore; // Large holder movements
+        uint256 newsPressureScore;
+        uint256 whaleActivityScore;
     }
 
     struct PriceHistory {
         uint256 timestamp;
         uint256 price;
         uint256 confidence;
-        string reason; // Why price changed
+        string reason;
         uint256 marketVolume;
-        uint256 gasPrice; // Gas price at time of update
+        uint256 gasPrice;
     }
 
     struct AutoPricingRules {
         bool enableAutoUpdate;
-        uint256 updateFrequency; // In seconds
+        uint256 updateFrequency;
         uint256 minConfidenceLevel;
-        uint256 maxPriceIncrease; // Per update, in basis points
-        uint256 maxPriceDecrease; // Per update, in basis points
+        uint256 maxPriceIncrease;
+        uint256 maxPriceDecrease;
         bool pauseOnHighVolatility;
         uint256 volatilityThreshold;
         bool enableEmergencyStop;
@@ -280,127 +558,6 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         uint256[] factorWeights;
         uint256 trendStrength;
         bool isBreakoutPattern;
-    }
-
-    enum PricingType { 
-        Conservative,    // Slow, steady adjustments
-        Balanced,       // Moderate adjustments
-        Aggressive,     // Fast market reaction
-        Momentum,       // Follow trends strongly
-        Contrarian,     // Counter-trend strategy
-        ValueBased,     // Fundamental analysis focus
-        Technical       // Chart pattern focus
-    }
-
-    // ========== Previous Structs (Condensed) ==========
-    
-    struct Vector3 {
-        int256 x;
-        int256 y;
-        int256 z;
-    }
-
-    struct MetaverseItem {
-        uint256 metaverseId;
-        uint256 tokenId;
-        string worldId;
-        Vector3 position;
-        Vector3 rotation;
-        Vector3 scale;
-        bool isInteractive;
-        string[] animations;
-        mapping(address => uint256) accessHistory;
-        uint256 lastInteraction;
-        bool isPublic;
-        uint256 visitCount;
-        mapping(address => bool) authorizedUsers;
-    }
-
-    struct DAOGovernance {
-        uint256 daoId;
-        string name;
-        string description;
-        address treasuryAddress;
-        uint256 totalMembers;
-        uint256 activeProposals;
-        uint256 totalProposals;
-        mapping(address => DAOMember) members;
-        mapping(uint256 => DAOProposal) proposals;
-        uint256 totalTreasuryValue;
-        bool isActive;
-    }
-
-    struct DAOMember {
-        address memberAddress;
-        uint256 joinedAt;
-        uint256 votingPower;
-        uint256 contributionScore;
-        uint256 proposalsCreated;
-        uint256 votesParticipated;
-        bool isActive;
-        DAOMemberTier tier;
-        uint256 reputationScore;
-        mapping(uint256 => bool) proposalVotes;
-    }
-
-    enum DAOMemberTier { Bronze, Silver, Gold, Platinum, Diamond }
-
-    struct DAOProposal {
-        uint256 proposalId;
-        string title;
-        string description;
-        address proposer;
-        uint256 createdAt;
-        uint256 votingStart;
-        uint256 votingEnd;
-        uint256 forVotes;
-        uint256 againstVotes;
-        uint256 abstainVotes;
-        bool executed;
-        bool cancelled;
-        ProposalType proposalType;
-        bytes executionData;
-        uint256 requiredQuorum;
-        mapping(address => Vote) votes;
-        uint256 totalVoters;
-    }
-
-    struct Vote {
-        bool hasVoted;
-        bool support;
-        uint256 weight;
-        string comment;
-    }
-
-    struct MusicNFT {
-        uint256 musicId;
-        uint256 tokenId;
-        string trackName;
-        string artist;
-        string album;
-        uint256 duration;
-        string genre;
-        uint256 bpm;
-        string key;
-        uint256 totalStreams;
-        bool isRemixable;
-        uint256[] remixTokenIds;
-        mapping(address => bool) collaborators;
-    }
-
-    struct CarbonOffset {
-        uint256 carbonId;
-        uint256 tokenId;
-        uint256 carbonFootprint;
-        uint256 offsetAmount;
-        string offsetProvider;
-        string offsetProject;
-        bool isVerified;
-        uint256 offsetCertificateId;
-        uint256 offsetDate;
-        mapping(address => uint256) userContributions;
-        uint256 totalOffsetCost;
-        bool isFullyOffset;
     }
 
     struct Collection { 
@@ -457,31 +614,55 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         bool isRealEstate;
         bool isFractional;
         uint256 utilityScore;
-        // NEW: Dynamic pricing integration
         bool hasDynamicPricing;
         uint256 aiPricingId;
+        // NEW FIELDS
+        bool isGameAsset;
+        uint256 gameAssetId;
+        bool isInVirtualGallery;
+        uint256[] galleryIds;
+        bool crossChainEnabled;
+        uint256[] supportedChainIds;
     }
 
+    struct DAOMember {
+        address memberAddress;
+        uint256 joinedAt;
+        uint256 votingPower;
+        uint256 contributionScore;
+        uint256 proposalsCreated;
+        uint256 votesParticipated;
+        bool isActive;
+        DAOMemberTier tier;
+        uint256 reputationScore;
+        mapping(uint256 => bool) proposalVotes;
+    }
+
+    enum PricingType { Conservative, Balanced, Aggressive, Momentum, Contrarian, ValueBased, Technical }
+    enum DAOMemberTier { Bronze, Silver, Gold, Platinum, Diamond }
     enum PaymentMethod { ETH, ERC20, Crypto, Fiat }
     enum ProposalType { FeeChange, CategoryAdd, FeatureToggle, Emergency, ParameterChange }
 
-    // ========== Enhanced Mappings ==========
+    // ========== MAPPINGS ==========
     mapping(uint256 => MarketItem) private idToMarketItem;
     mapping(uint256 => Collection) private idToCollection;
-    mapping(uint256 => MetaverseItem) private idToMetaverseItem;
-    mapping(uint256 => DAOGovernance) private idToDAO;
-    mapping(uint256 => MusicNFT) private idToMusicNFT;
-    mapping(uint256 => CarbonOffset) private idToCarbonOffset;
-
-    // NEW: Dynamic Pricing Mappings
     mapping(uint256 => DynamicPricing) private idToDynamicPricing;
     mapping(uint256 => AIMarketAnalysis) private idToMarketAnalysis;
+
+    // NEW MAPPINGS
+    mapping(uint256 => VirtualGallery) private idToVirtualGallery;
+    mapping(uint256 => AIArtGeneration) private idToAIArtGeneration;
+    mapping(address => UserSubscription) private userSubscriptions;
+    mapping(uint256 => SubscriptionTier) private subscriptionTiers;
+    mapping(uint256 => LoyaltyProgram) private loyaltyPrograms;
+    mapping(uint256 => CrossChainBridge) private idToCrossChainBridge;
+    mapping(uint256 => GameAssetIntegration) private idToGameAsset;
+    
     mapping(address => bool) private authorizedAIOracles;
-    mapping(uint256 => mapping(uint256 => uint256)) private tokenPriceByHour; // tokenId => hour => price
+    mapping(uint256 => mapping(uint256 => uint256)) private tokenPriceByHour;
     mapping(string => uint256) private categoryMarketTrends;
     mapping(address => uint256) private collectionMarketScores;
-
-    // User and system mappings
+    
     mapping(address => bool) private verifiedCreators;
     mapping(string => bool) private validCategories;
     mapping(address => uint256) private creatorEarnings;
@@ -494,11 +675,18 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     mapping(uint256 => mapping(address => bool)) private tokenApprovals;
     mapping(address => uint256) private votingPower;
     mapping(address => DAOMember) private daoMembers;
-    mapping(address => uint256[]) private userMetaverseItems;
-    mapping(string => bool) private supportedMetaversePlatforms;
     mapping(address => uint256) private carbonContributions;
 
-    // NEW: Dynamic Pricing Configuration
+    // NEW SPECIFIC MAPPINGS
+    mapping(address => uint256[]) private userVirtualGalleries;
+    mapping(address => mapping(uint256 => uint256)) private userAIGenerations; // user => day => count
+    mapping(string => bool) private supportedAIStyles;
+    mapping(uint256 => bool) private supportedChains;
+    mapping(address => uint256[]) private userCrossChainTokens;
+    mapping(string => mapping(uint256 => bool)) private gameAssetInGame;
+    mapping(address => mapping(string => uint256)) private playerGameStats;
+
+    // Configuration
     address public aiPricingOracle;
     bool public globalPricingEnabled;
     uint256 public marketSentimentWeight;
@@ -507,8 +695,6 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     uint256 public socialWeight;
     uint256 public utilityWeight;
     uint256 public lastGlobalMarketUpdate;
-
-    // Configuration
     uint256 public actionCooldown = 1 seconds;
     bool public aiRecommendationsEnabled = true;
     bool public socialTradingEnabled = true;
@@ -518,10 +704,18 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     bool public carbonOffsetEnabled = true;
     bool public crossChainEnabled = true;
 
-    // Platform fee balance
+    // NEW CONFIGURATION
+    bool public virtualGalleriesEnabled = true;
+    bool public aiArtGenerationEnabled = true;
+    bool public loyaltyProgramEnabled = true;
+    bool public gameAssetIntegrationEnabled = true;
+    uint256 public defaultLoyaltyProgramId = 1;
+
     uint256 private platformFeeBalance;
 
-    // ========== NEW: Dynamic Pricing AI Events ==========
+    // ========== EVENTS ==========
+    
+    // Dynamic Pricing AI Events
     event DynamicPricingEnabled(uint256 indexed tokenId, uint256 basePrice, PricingType strategy);
     event AIPriceUpdated(uint256 indexed tokenId, uint256 oldPrice, uint256 newPrice, uint256 confidence, string reason);
     event PricingStrategyChanged(uint256 indexed tokenId, PricingType oldStrategy, PricingType newStrategy);
@@ -530,513 +724,21 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     event PricingOracleUpdated(address indexed oldOracle, address indexed newOracle);
     event AIPricingConfigured(uint256 tokenId, AutoPricingRules rules);
 
-    // Previous events
-    event MetaverseItemCreated(uint256 indexed metaverseId, uint256 indexed tokenId, string worldId);
-    event MetaverseAccessed(uint256 indexed tokenId, address indexed user, uint256 duration);
-    event DAOCreated(uint256 indexed daoId, string name, address creator);
-    event DAOMemberJoined(uint256 indexed daoId, address indexed member, DAOMemberTier tier);
-    event DAOProposalCreated(uint256 indexed daoId, uint256 indexed proposalId, string title);
-    event DAOVoteCast(uint256 indexed proposalId, address indexed voter, bool support, uint256 weight);
-    event MusicNFTCreated(uint256 indexed musicId, uint256 indexed tokenId, string trackName, string artist);
-    event MusicStreamed(uint256 indexed tokenId, address indexed listener, uint256 streamCount);
-    event CarbonOffsetPurchased(uint256 indexed carbonId, uint256 indexed tokenId, uint256 offsetAmount);
+    // Basic marketplace events
     event MarketItemCreated(uint256 indexed tokenId, address seller, address owner, uint256 price, bool sold, string category);
     event MarketItemSold(uint256 indexed tokenId, address seller, address buyer, uint256 price, address indexed referrer);
 
-    // ========== NEW: Dynamic Pricing AI Functions ==========
-    
-    /**
-     * @dev Enable dynamic pricing for a token with AI-powered price adjustments
-     */
-    function enableDynamicPricing(
-        uint256 tokenId,
-        uint256 basePrice,
-        PricingType strategy,
-        AutoPricingRules memory rules
-    ) external onlyTokenOwner(tokenId) nonReentrant returns (uint256) {
-        require(globalPricingEnabled, "Dynamic pricing disabled globally");
-        require(!idToDynamicPricing[tokenId].isActive, "Dynamic pricing already enabled");
-        require(basePrice > 0, "Base price must be positive");
-        
-        _aiPricingIds.increment();
-        uint256 aiPricingId = _aiPricingIds.current();
-        
-        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
-        pricing.aiPricingId = aiPricingId;
-        pricing.tokenId = tokenId;
-        pricing.basePrice = basePrice;
-        pricing.currentAIPrice = basePrice;
-        pricing.lastUpdateTime = block.timestamp;
-        pricing.priceConfidence = 5000; // 50% initial confidence
-        pricing.isActive = true;
-        pricing.ownerOptedIn = true;
-        pricing.totalUpdates = 0;
-        pricing.accuracyScore = 0;
-        pricing.rules = rules;
-        
-        // Set pricing strategy
-        pricing.strategy.pricingType = strategy;
-        pricing.strategy.targetVolatility = _getTargetVolatilityForStrategy(strategy);
-        pricing.strategy.responsiveness = _getResponsivenessForStrategy(strategy);
-        pricing.strategy.trendFollowing = _getTrendFollowingForStrategy(strategy);
-        pricing.strategy.enableFloorProtection = true;
-        pricing.strategy.floorPriceMultiplier = 8000; // 80% of floor price
-        pricing.strategy.enableCeilingCap = true;
-        pricing.strategy.ceilingPriceMultiplier = 15000; // 150% of ceiling price
-        
-        // Initialize market factors
-        _initializeMarketFactors(tokenId);
-        
-        // Update market item
-        idToMarketItem[tokenId].hasDynamicPricing = true;
-        idToMarketItem[tokenId].aiPricingId = aiPricingId;
-        idToMarketItem[tokenId].price = basePrice;
-        
-        emit DynamicPricingEnabled(tokenId, basePrice, strategy);
-        return aiPricingId;
-    }
-    
-    /**
-     * @dev Update AI-calculated price for a token
-     */
-    function updateAIPrice(
-        uint256 tokenId,
-        uint256 newPrice,
-        uint256 confidence,
-        string memory reason,
-        bytes memory signature
-    ) external onlyAIPricingOracle validPricingUpdate(tokenId, newPrice, confidence) nonReentrant {
-        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
-        require(pricing.isActive, "Dynamic pricing not active");
-        require(block.timestamp >= pricing.lastUpdateTime + AI_PRICING_UPDATE_INTERVAL, "Update too frequent");
-        
-        // Verify signature for price update (EIP-712)
-        bytes32 hash = _hashTypedDataV4(keccak256(abi.encode(
-            _AI_PRICING_TYPEHASH,
-            tokenId,
-            newPrice,
-            confidence,
-            block.timestamp,
-            userNonce[msg.sender]++
-        )));
-        require(hash.recover(signature) == aiPricingOracle, "Invalid signature");
-        
-        uint256 oldPrice = pricing.currentAIPrice;
-        
-        // Apply pricing rules and constraints
-        uint256 constrainedPrice = _applyPricingConstraints(tokenId, newPrice, confidence);
-        
-        // Update pricing data
-        pricing.currentAIPrice = constrainedPrice;
-        pricing.priceConfidence = confidence;
-        pricing.lastUpdateTime = block.timestamp;
-        pricing.totalUpdates++;
-        
-        // Add to price history
-        pricing.priceHistory.push(PriceHistory({
-            timestamp: block.timestamp,
-            price: constrainedPrice,
-            confidence: confidence,
-            reason: reason,
-            marketVolume: _getCurrentMarketVolume(),
-            gasPrice: tx.gasprice
-        }));
-        
-        // Update market item price
-        idToMarketItem[tokenId].price = constrainedPrice;
-        
-        // Store hourly price data for analysis
-        uint256 currentHour = block.timestamp / 3600;
-        tokenPriceByHour[tokenId][currentHour] = constrainedPrice;
-        
-        // Update accuracy score if enough history
-        if (pricing.totalUpdates > 10) {
-            _updateAccuracyScore(tokenId);
-        }
-        
-        emit AIPriceUpdated(tokenId, oldPrice, constrainedPrice, confidence, reason);
-    }
-    
-    /**
-     * @dev Perform comprehensive market analysis and update global trends
-     */
-    function performMarketAnalysis() external onlyAIPricingOracle returns (uint256) {
-        require(block.timestamp >= lastGlobalMarketUpdate + 1 hours, "Analysis too frequent");
-        
-        _analyticsIds.increment();
-        uint256 analysisId = _analyticsIds.current();
-        
-        AIMarketAnalysis storage analysis = idToMarketAnalysis[analysisId];
-        analysis.analysisId = analysisId;
-        analysis.timestamp = block.timestamp;
-        
-        // Calculate overall market sentiment
-        analysis.overallMarketSentiment = _calculateOverallMarketSentiment();
-        analysis.nftMarketTrend = _calculateNFTMarketTrend();
-        analysis.predictedVolatility = _calculatePredictedVolatility();
-        
-        // Update category trends
-        _updateCategoryTrends(analysisId);
-        
-        // Update collection trends
-        _updateCollectionTrends(analysisId);
-        
-        // Generate market predictions
-        _generateMarketPredictions(analysisId);
-        
-        lastGlobalMarketUpdate = block.timestamp;
-        
-        emit MarketAnalysisUpdated(analysisId, analysis.overallMarketSentiment, block.timestamp);
-        return analysisId;
-    }
-    
-    /**
-     * @dev Change pricing strategy for a token
-     */
-    function changePricingStrategy(
-        uint256 tokenId,
-        PricingType newStrategy
-    ) external onlyTokenOwner(tokenId) {
-        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
-        require(pricing.isActive, "Dynamic pricing not active");
-        
-        PricingType oldStrategy = pricing.strategy.pricingType;
-        pricing.strategy.pricingType = newStrategy;
-        pricing.strategy.targetVolatility = _getTargetVolatilityForStrategy(newStrategy);
-        pricing.strategy.responsiveness = _getResponsivenessForStrategy(newStrategy);
-        pricing.strategy.trendFollowing = _getTrendFollowingForStrategy(newStrategy);
-        
-        emit PricingStrategyChanged(tokenId, oldStrategy, newStrategy);
-    }
-    
-    /**
-     * @dev Emergency stop for dynamic pricing
-     */
-    function emergencyStopPricing(uint256 tokenId, string memory reason) external nonReentrant {
-        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
-        require(pricing.isActive, "Dynamic pricing not active");
-        
-        bool canStop = false;
-        
-        // Check if caller is authorized
-        if (msg.sender == ownerOf(tokenId) || msg.sender == owner() || msg.sender == aiPricingOracle || authorizedAIOracles[msg.sender]) {
-            canStop = true;
-        } else {
-            // Check if caller is in emergency stoppers list
-            for (uint256 i = 0; i < pricing.rules.emergencyStoppers.length; i++) {
-                if (pricing.rules.emergencyStoppers[i] == msg.sender) {
-                    canStop = true;
-                    break;
-                }
-            }
-        }
-        
-        require(canStop, "Not authorized for emergency stop");
-        
-        pricing.isActive = false;
-        // Optionally freeze current price on market item
-        idToMarketItem[tokenId].hasDynamicPricing = false;
-        
-        emit EmergencyPricingStop(tokenId, msg.sender, reason);
-    }
-
-    // ========== NEW ADMIN / ORACLE MANAGEMENT ==========
-    function setAIPricingOracle(address newOracle) external onlyOwner {
-        require(newOracle != address(0), "Zero address");
-        address old = aiPricingOracle;
-        aiPricingOracle = newOracle;
-        authorizedAIOracles[newOracle] = true;
-        emit PricingOracleUpdated(old, newOracle);
-    }
-
-    function authorizeAIPricer(address who) external onlyOwner {
-        authorizedAIOracles[who] = true;
-    }
-
-    function revokeAIPricer(address who) external onlyOwner {
-        authorizedAIOracles[who] = false;
-    }
-
-    function toggleGlobalPricing(bool enabled) external onlyOwner {
-        globalPricingEnabled = enabled;
-    }
-
-    /**
-     * @dev Owner (token owner) can opt-out dynamic pricing and disable AI control over their token.
-     */
-    function ownerOptOutDynamicPricing(uint256 tokenId) external onlyTokenOwner(tokenId) {
-        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
-        require(pricing.isActive, "Not active");
-        pricing.isActive = false;
-        pricing.ownerOptedIn = false;
-        idToMarketItem[tokenId].hasDynamicPricing = false;
-    }
-
-    /**
-     * @dev Configure global weighting (e.g., weights used in internal scoring).
-     * values are basis points (sum should be <= 10000 but check isn't enforced here)
-     */
-    function configureGlobalWeights(uint256 _marketSentimentWeight, uint256 _rarityWeight, uint256 _volumeWeight, uint256 _socialWeight, uint256 _utilityWeight) external onlyOwner {
-        marketSentimentWeight = _marketSentimentWeight;
-        rarityWeight = _rarityWeight;
-        volumeWeight = _volumeWeight;
-        socialWeight = _socialWeight;
-        utilityWeight = _utilityWeight;
-    }
-
-    /**
-     * @dev Withdraw platform fees collected by the contract
-     */
-    function withdrawPlatformFees(address payable to) external onlyOwner nonReentrant {
-        require(to != address(0), "Zero addr");
-        uint256 amount = platformFeeBalance;
-        require(amount > 0, "No balance");
-        platformFeeBalance = 0;
-        (bool sent, ) = to.call{value: amount}("");
-        require(sent, "Withdraw failed");
-    }
-
-    // ========== GETTERS ==========
-    function getCurrentAIPrice(uint256 tokenId) external view returns (uint256 price, uint256 confidence, bool active) {
-        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
-        return (pricing.currentAIPrice, pricing.priceConfidence, pricing.isActive);
-    }
-
-    /**
-     * @dev Return price history arrays for a token's dynamic pricing
-     */
-    function getPriceHistory(uint256 tokenId) external view returns (uint256[] memory timestamps, uint256[] memory prices, uint256[] memory confidences, string[] memory reasons) {
-        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
-        uint256 len = pricing.priceHistory.length;
-        timestamps = new uint256[](len);
-        prices = new uint256[](len);
-        confidences = new uint256[](len);
-        reasons = new string[](len);
-
-        for (uint256 i = 0; i < len; i++) {
-            PriceHistory storage p = pricing.priceHistory[i];
-            timestamps[i] = p.timestamp;
-            prices[i] = p.price;
-            confidences[i] = p.confidence;
-            reasons[i] = p.reason;
-        }
-        return (timestamps, prices, confidences, reasons);
-    }
-
-    function getDynamicPricingInfo(uint256 tokenId) external view returns (
-        uint256 aiPricingId,
-        uint256 basePrice,
-        uint256 currentAIPrice,
-        uint256 lastUpdateTime,
-        uint256 priceConfidence,
-        bool isActive,
-        bool ownerOptedIn,
-        uint256 totalUpdates,
-        uint256 accuracyScore
-    ) {
-        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
-        return (
-            pricing.aiPricingId,
-            pricing.basePrice,
-            pricing.currentAIPrice,
-            pricing.lastUpdateTime,
-            pricing.priceConfidence,
-            pricing.isActive,
-            pricing.ownerOptedIn,
-            pricing.totalUpdates,
-            pricing.accuracyScore
-        );
-    }
-
-    // ========== INTERNAL / SIMPLE HELPERS (placeholders you can extend) ==========
-    function _applyPricingConstraints(uint256 tokenId, uint256 requestedPrice, uint256 confidence) internal view returns (uint256) {
-        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
-        uint256 result = requestedPrice;
-
-        // ensure confidence threshold
-        if (confidence < PRICING_CONFIDENCE_THRESHOLD) {
-            // Should be prevented by modifier, but safe-guard
-            revert("confidence too low");
-        }
-
-        // clamp change relative to current price if active
-        if (pricing.isActive && pricing.currentAIPrice > 0) {
-            uint256 current = pricing.currentAIPrice;
-            uint256 maxChange = (current * MAX_PRICE_CHANGE_PER_UPDATE) / 10000;
-            if (result > current + maxChange) {
-                result = current + maxChange;
-            }
-            if (result < current && current - result > maxChange) {
-                result = current - maxChange;
-            }
-        }
-
-        // minimal positive
-        if (result == 0) {
-            result = 1;
-        }
-
-        return result;
-    }
-
-    function _initializeMarketFactors(uint256 /* tokenId */) internal {
-        // Placeholder: in production, fetch collection floor, volume, social etc.
-        // For now do nothing.
-    }
-
-    function _getTargetVolatilityForStrategy(PricingType strategy) internal pure returns (uint256) {
-        if (strategy == PricingType.Conservative) return 500; // 5%
-        if (strategy == PricingType.Balanced) return 1000; // 10%
-        if (strategy == PricingType.Aggressive) return 2000; // 20%
-        if (strategy == PricingType.Momentum) return 1500;
-        if (strategy == PricingType.Contrarian) return 1200;
-        if (strategy == PricingType.ValueBased) return 800;
-        return 1000;
-    }
-
-    function _getResponsivenessForStrategy(PricingType strategy) internal pure returns (uint256) {
-        if (strategy == PricingType.Conservative) return 10;
-        if (strategy == PricingType.Balanced) return 50;
-        if (strategy == PricingType.Aggressive) return 90;
-        if (strategy == PricingType.Momentum) return 80;
-        if (strategy == PricingType.Contrarian) return 60;
-        if (strategy == PricingType.ValueBased) return 30;
-        return 50;
-    }
-
-    function _getTrendFollowingForStrategy(PricingType strategy) internal pure returns (uint256) {
-        if (strategy == PricingType.Momentum) return 90;
-        if (strategy == PricingType.Aggressive) return 70;
-        if (strategy == PricingType.Balanced) return 50;
-        return 20;
-    }
-
-    function _getCurrentMarketVolume() internal pure returns (uint256) {
-        // Placeholder: replace with real market volume source
-        return 0;
-    }
-
-    function _updateAccuracyScore(uint256 tokenId) internal {
-        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
-        // Placeholder: basic increment proportional to updates
-        pricing.accuracyScore = pricing.totalUpdates; // simplistic
-    }
-
-    function _calculateOverallMarketSentiment() internal view returns (uint256) {
-        // Placeholder: basic neutral sentiment
-        return 5000;
-    }
-
-    function _calculateNFTMarketTrend() internal view returns (uint256) {
-        return 5000;
-    }
-
-    function _calculatePredictedVolatility() internal view returns (uint256) {
-        return 1000;
-    }
-
-    function _updateCategoryTrends(uint256 /* analysisId */) internal {
-        // Placeholder
-    }
-
-    function _updateCollectionTrends(uint256 /* analysisId */) internal {
-        // Placeholder
-    }
-
-    function _generateMarketPredictions(uint256 /* analysisId */) internal {
-        // Placeholder
-    }
-
-    // ========== OVERRIDES / SAFETY ==========
-    function _beforeTokenTransfer(address from, address to, uint256 tokenId) internal override(ERC721) whenNotPaused {
-        super._beforeTokenTransfer(from, to, tokenId);
-    }
-
-    // Receive ETH (marketplace fees etc)
-    receive() external payable {
-        platformFeeBalance += msg.value;
-    }
-
-    fallback() external payable {
-        platformFeeBalance += msg.value;
-    }
-
-    // Example mint (very simple) - callers should implement proper minting, royalties, etc.
-    function simpleMint(string memory tokenURI) external returns (uint256) {
-        _tokenIds.increment();
-        uint256 newTokenId = _tokenIds.current();
-        _safeMint(msg.sender, newTokenId);
-        _setTokenURI(newTokenId, tokenURI);
-        // Setup default MarketItem
-        idToMarketItem[newTokenId] = MarketItem({
-            tokenId: newTokenId,
-            seller: payable(msg.sender),
-            owner: payable(msg.sender),
-            creator: payable(msg.sender),
-            price: 0,
-            createdAt: block.timestamp,
-            expiresAt: 0,
-            sold: false,
-            isAuction: false,
-            category: "",
-            collectionId: 0,
-            views: 0,
-            likes: 0,
-            isExclusive: false,
-            unlockableContentHash: 0,
-            collaborators: new address,
-            collaboratorShares: new uint256,
-            isLazyMinted: false,
-            editionNumber: 0,
-            totalEditions: 0,
-            acceptsOffers: false,
-            minOffer: 0,
-            isMetaverseEnabled: false,
-            isAIGenerated: false,
-            hasCarbonOffset: false,
-            isMusicNFT: false,
-            isRealEstate: false,
-            isFractional: false,
-            utilityScore: 0,
-            hasDynamicPricing: false,
-            aiPricingId: 0
-        });
-        return newTokenId;
-    }
-
-    // A simple helper to mark a creator as verified (owner only)
-    function setVerifiedCreator(address creator, bool verified) external onlyOwner {
-        verifiedCreators[creator] = verified;
-    }
-
-    // Pause / unpause
-    function pause() external onlyOwner {
-        _pause();
-    }
-
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-
-    // Example emergency setter for platform fee (owner)
-    function setPlatformFee(uint256 feeBasisPoints) external onlyOwner {
-        platformFee = feeBasisPoints;
-    }
-
-    // Helper: allow token owner to enable an authorized updater for their token's dynamic pricing
-    function authorizeUpdaterForToken(uint256 tokenId, address updater) external onlyTokenOwner(tokenId) {
-        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
-        pricing.authorizedUpdaters[updater] = true;
-    }
-
-    function revokeUpdaterForToken(uint256 tokenId, address updater) external onlyTokenOwner(tokenId) {
-        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
-        pricing.authorizedUpdaters[updater] = false;
-    }
-
-    // Safety: check if address is authorized for given token (used externally if needed)
-    function isAuthorizedUpdater(uint256 tokenId, address who) external view returns (bool) {
-        DynamicPricing storage pricing = idToDynamicPricing[tokenId];
-        return pricing.authorizedUpdaters[who];
-    }
-}
+    // NEW EVENTS
+    event VirtualGalleryCreated(uint256 indexed galleryId, string name, address indexed owner);
+    event VirtualGalleryVisited(uint256 indexed galleryId, address indexed visitor, uint256 timestamp);
+    event TokenExhibited(uint256 indexed galleryId, uint256 indexed tokenId, address indexed curator);
+    event AIArtRequested(uint256 indexed aiArtId, address indexed requester, string prompt, string style);
+    event AIArtGenerated(uint256 indexed aiArtId, uint256 indexed tokenId, string resultURI);
+    event SubscriptionActivated(address indexed user, uint256 indexed tierId, uint256 duration);
+    event SubscriptionRenewed(address indexed user, uint256 indexed tierId, uint256 newEndTime);
+    event LoyaltyPointsEarned(address indexed user, uint256 points, string action);
+    event LoyaltyRewardClaimed(address indexed user, string rewardName, uint256 pointsSpent);
+    event CrossChainBridgeInitiated(uint256 indexed bridgeId, uint256 indexed tokenId, uint256 sourceChain, uint256 targetChain);
+    event CrossChainBridgeCompleted(uint256 indexed bridgeId, string targetTxHash);
+    event GameAssetCreated(uint256 indexed assetId, uint256 indexed tokenId, string gameId, string assetType);
+    event GameAssetUsed(uint256

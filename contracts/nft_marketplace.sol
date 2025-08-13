@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
+// ──────────────────────────────────────────────────────────────────────────────
+// OpenZeppelin
+// ──────────────────────────────────────────────────────────────────────────────
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+import "@openzeppelin/contracts/token/common/ERC2981.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
@@ -12,7 +16,17 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 
-contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable, EIP712 {
+// ──────────────────────────────────────────────────────────────────────────────
+// Marketplace
+// ──────────────────────────────────────────────────────────────────────────────
+contract NFTMarketplace is
+    ERC721URIStorage,
+    ERC2981,
+    ReentrancyGuard,
+    Ownable,
+    Pausable,
+    EIP712
+{
     using Counters for Counters.Counter;
     using ECDSA for bytes32;
 
@@ -31,10 +45,10 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
 
     // ========== CONSTANTS ==========
     uint256 public listingPrice = 0.025 ether;
-    uint256 public platformFee = 250; // 2.5%
+    uint256 public platformFee = 250; // 2.5% (basis points)
     uint256 public constant MAX_PLATFORM_FEE = 1000; // 10%
     uint256 public constant MAX_ROYALTY = 1000; // 10%
-    
+
     uint256 public constant VIRTUAL_GALLERY_FEE = 0.005 ether;
     uint256 public constant AI_GENERATION_FEE = 0.02 ether;
     uint256 public constant PREMIUM_SUBSCRIPTION_FEE = 0.1 ether;
@@ -42,28 +56,53 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     uint256 public constant MAX_AI_GENERATIONS_PER_DAY = 10;
     uint256 public constant LOYALTY_TIER_UPGRADE_THRESHOLD = 1000;
     uint256 public constant SUBSCRIPTION_DURATION = 30 days;
-    
+
     // AI Pricing Constants
     uint256 public constant AI_PRICING_UPDATE_INTERVAL = 1 hours;
     uint256 public constant MIN_PRICE_CHANGE_THRESHOLD = 50;
     uint256 public constant MAX_PRICE_CHANGE_PER_UPDATE = 2000;
     uint256 public constant PRICING_CONFIDENCE_THRESHOLD = 7000;
 
-    // ========== ENUMS ==========
-    enum PricingType { Conservative, Balanced, Aggressive, Momentum, Contrarian, ValueBased, Technical }
-    enum PaymentMethod { ETH, ERC20, Crypto, Fiat }
-    enum BridgeStatus { Pending, InProgress, Completed, Failed, Cancelled }
-    enum GalleryTheme { Modern, Classic, Cyberpunk, Nature, Abstract }
-    enum SubscriptionTierLevel { Basic, Premium, Professional, Enterprise }
+    // Auction constants
+    uint256 public constant MIN_AUCTION_DURATION = 1 hours;
+    uint256 public constant AUCTION_TIME_EXTENSION = 10 minutes;
 
-    // ========== STRUCTS ==========
-    
-    struct Vector3 {
-        int256 x;
-        int256 y;
-        int256 z;
+    // ========== ENUMS ==========
+    enum PricingType {
+        Conservative,
+        Balanced,
+        Aggressive,
+        Momentum,
+        Contrarian,
+        ValueBased,
+        Technical
+    }
+    enum PaymentMethod {
+        ETH,
+        ERC20
+    }
+    enum BridgeStatus {
+        Pending,
+        InProgress,
+        Completed,
+        Failed,
+        Cancelled
+    }
+    enum GalleryTheme {
+        Modern,
+        Classic,
+        Cyberpunk,
+        Nature,
+        Abstract
+    }
+    enum SubscriptionTierLevel {
+        Basic,
+        Premium,
+        Professional,
+        Enterprise
     }
 
+    // ========== STRUCTS ==========
     struct MarketItem {
         uint256 tokenId;
         address payable seller;
@@ -102,6 +141,8 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         uint256[] galleryIds;
         bool crossChainEnabled;
         uint256[] supportedChainIds;
+        PaymentMethod payWith; // NEW
+        address erc20; // NEW: optional ERC20 address if payWith == ERC20
     }
 
     struct Collection {
@@ -111,7 +152,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         address creator;
         uint256 totalSupply;
         uint256 maxSupply;
-        uint256 royaltyPercentage;
+        uint96 royaltyBps; // NEW: for ERC2981
         address royaltyReceiver;
         bool isVerified;
         string logoURI;
@@ -184,7 +225,7 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         string name;
         bool isActive;
         uint256 totalMembers;
-        uint256 pointsToEtherRate;
+        uint256 pointsToEtherRate; // 1e18 scale
     }
 
     struct LoyaltyMember {
@@ -241,15 +282,32 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         mapping(address => bool) authorizedUpdaters;
     }
 
+    // Offers
+    struct Offer {
+        address bidder;
+        uint256 amount; // in ETH
+        uint256 createdAt;
+    }
+
+    // Auctions
+    struct Auction {
+        bool active;
+        uint256 tokenId;
+        address payable seller;
+        uint256 startPrice;
+        uint256 highestBid;
+        address payable highestBidder;
+        uint256 endTime;
+        address referrer;
+    }
+
     // ========== EIP-712 TYPE HASHES ==========
-    bytes32 private constant _LAZY_MINT_TYPEHASH = 
-        keccak256("LazyMintVoucher(uint256 tokenId,uint256 price,string uri,address creator,uint256 nonce,uint256 expiry)");
-    bytes32 private constant _CROSS_CHAIN_TYPEHASH =
-        keccak256("CrossChainTransfer(uint256 tokenId,uint256 targetChain,address targetAddress,uint256 nonce,uint256 expiry)");
-    bytes32 private constant _AI_GENERATION_TYPEHASH =
-        keccak256("AIGeneration(address user,string prompt,string style,uint256 nonce,uint256 expiry)");
-    bytes32 private constant _AI_PRICING_TYPEHASH =
-        keccak256("AIPricingUpdate(uint256 tokenId,uint256 newPrice,uint256 confidence,uint256 timestamp,uint256 nonce)");
+    // Lazy mint voucher
+    // NOTE: tokenId==0 means "mint a new token id assigned by contract".
+    bytes32 private constant _LAZY_MINT_TYPEHASH =
+        keccak256(
+            "LazyMintVoucher(uint256 tokenId,uint256 price,string uri,address creator,uint256 nonce,uint256 expiry)"
+        );
 
     // ========== MAPPINGS ==========
     mapping(uint256 => MarketItem) private idToMarketItem;
@@ -277,6 +335,21 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     mapping(address => uint256) private userNonce;
     mapping(address => bool) private authorizedAIOracles;
 
+    // Payments config
+    mapping(address => bool) public allowedERC20; // token => allowed
+
+    // Offers and auctions
+    mapping(uint256 => Offer) public bestOffer; // tokenId => best offer
+    mapping(uint256 => Auction) public auctions; // tokenId => auction
+
+    // Allowlist
+    bytes32 public allowlistRoot;
+    mapping(address => uint256) public allowlistMinted;
+
+    // Referrals
+    uint256 public referralBps = 200; // 2% of platform fee by default (NOT of sale price)
+    mapping(address => uint256) public referralEarnings;
+
     // Platform configuration
     address public aiPricingOracle;
     bool public globalPricingEnabled = true;
@@ -289,8 +362,28 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     uint256 private platformFeeBalance;
 
     // ========== EVENTS ==========
-    event MarketItemCreated(uint256 indexed tokenId, address seller, address owner, uint256 price, bool sold, string category);
-    event MarketItemSold(uint256 indexed tokenId, address seller, address buyer, uint256 price, address indexed referrer);
+    event MarketItemCreated(
+        uint256 indexed tokenId,
+        address seller,
+        address owner,
+        uint256 price,
+        bool sold,
+        string category
+    );
+    event MarketItemSold(
+        uint256 indexed tokenId,
+        address seller,
+        address buyer,
+        uint256 price,
+        address indexed referrer
+    );
+    event ListingCancelled(uint256 indexed tokenId);
+    event OfferMade(uint256 indexed tokenId, address bidder, uint256 amount);
+    event OfferCancelled(uint256 indexed tokenId, address bidder, uint256 amount);
+    event OfferAccepted(uint256 indexed tokenId, address seller, address bidder, uint256 amount);
+    event AuctionCreated(uint256 indexed tokenId, uint256 startPrice, uint256 endTime);
+    event AuctionBid(uint256 indexed tokenId, address bidder, uint256 amount);
+    event AuctionFinalized(uint256 indexed tokenId, address winner, uint256 amount);
     event VirtualGalleryCreated(uint256 indexed galleryId, string name, address indexed owner);
     event VirtualGalleryVisited(uint256 indexed galleryId, address indexed visitor, uint256 timestamp);
     event TokenExhibited(uint256 indexed galleryId, uint256 indexed tokenId, address indexed curator);
@@ -325,9 +418,11 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     }
 
     modifier onlyPremiumSubscriber() {
-        require(userSubscriptions[msg.sender].isActive && 
-                userSubscriptions[msg.sender].currentTier >= SubscriptionTierLevel.Premium, 
-                "Premium subscription required");
+        require(
+            userSubscriptions[msg.sender].isActive &&
+                userSubscriptions[msg.sender].currentTier >= SubscriptionTierLevel.Premium,
+            "Premium subscription required"
+        );
         _;
     }
 
@@ -349,20 +444,18 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     }
 
     modifier onlyAIPricingOracle() {
-        require(msg.sender == aiPricingOracle || msg.sender == owner() || authorizedAIOracles[msg.sender], 
-                "Not authorized for AI pricing");
-        _;
-    }
-
-    modifier validPricingUpdate(uint256 tokenId, uint256 newPrice, uint256 confidence) {
-        require(newPrice > 0, "Price must be positive");
-        require(confidence >= PRICING_CONFIDENCE_THRESHOLD, "Confidence too low");
-        require(idToDynamicPricing[tokenId].isActive, "Dynamic pricing not active");
+        require(
+            msg.sender == aiPricingOracle || msg.sender == owner() || authorizedAIOracles[msg.sender],
+            "Not authorized for AI pricing"
+        );
         _;
     }
 
     // ========== CONSTRUCTOR ==========
-    constructor() ERC721("NFT Marketplace", "NFTM") EIP712("NFTMarketplace", "1") {
+    constructor()
+        ERC721("NFT Marketplace", "NFTM")
+        EIP712("NFTMarketplace", "1")
+    {
         // Initialize valid categories
         validCategories["Art"] = true;
         validCategories["Music"] = true;
@@ -393,189 +486,421 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
         supportedAIStyles["Cyberpunk"] = true;
         supportedAIStyles["Fantasy"] = true;
 
-        // Create default loyalty program
+        // Default loyalty program and subscription tiers
         _createDefaultLoyaltyProgram();
-        
-        // Create default subscription tiers
         _createDefaultSubscriptionTiers();
+
+        // Default royalty 5% to owner (can change)
+        _setDefaultRoyalty(msg.sender, 500);
     }
 
-    // ========== CORE MARKETPLACE FUNCTIONS ==========
+    // ========== MARKETPLACE: LIST, BUY, CANCEL ==========
 
     function createMarketItem(
         uint256 tokenId,
         uint256 price,
-        string memory category,
-        uint256 collectionId
-    ) public nonReentrant validTokenId(tokenId) {
-        require(price > 0, "Price must be greater than 0");
+        string calldata category,
+        uint256 collectionId,
+        PaymentMethod payWith,
+        address erc20 // 0 if ETH
+    ) external nonReentrant validTokenId(tokenId) whenNotPaused {
+        require(price > 0, "Price must be > 0");
         require(validCategories[category], "Invalid category");
         require(ownerOf(tokenId) == msg.sender, "Not token owner");
 
-        idToMarketItem[tokenId] = MarketItem({
-            tokenId: tokenId,
-            seller: payable(msg.sender),
-            owner: payable(address(0)),
-            creator: payable(msg.sender),
-            price: price,
-            createdAt: block.timestamp,
-            expiresAt: 0,
-            sold: false,
-            isAuction: false,
-            category: category,
-            collectionId: collectionId,
-            views: 0,
-            likes: 0,
-            isExclusive: false,
-            unlockableContentHash: bytes32(0),
-            collaborators: new address[](0),
-            collaboratorShares: new uint256[](0),
-            isLazyMinted: false,
-            editionNumber: 0,
-            totalEditions: 0,
-            acceptsOffers: false,
-            minOffer: 0,
-            isMetaverseEnabled: false,
-            isAIGenerated: false,
-            hasCarbonOffset: false,
-            isMusicNFT: false,
-            isRealEstate: false,
-            isFractional: false,
-            utilityScore: 0,
-            hasDynamicPricing: false,
-            aiPricingId: 0,
-            isGameAsset: false,
-            gameAssetId: 0,
-            isInVirtualGallery: false,
-            galleryIds: new uint256[](0),
-            crossChainEnabled: false,
-            supportedChainIds: new uint256[](0)
-        });
+        if (payWith == PaymentMethod.ERC20) {
+            require(allowedERC20[erc20], "ERC20 not allowed");
+        } else {
+            require(erc20 == address(0), "ETH listing requires erc20=0");
+        }
 
+        // Pull NFT into escrow
         _transfer(msg.sender, address(this), tokenId);
+
+        MarketItem storage m = idToMarketItem[tokenId];
+        m.tokenId = tokenId;
+        m.seller = payable(msg.sender);
+        m.owner = payable(address(0));
+        m.creator = m.creator == address(0) ? payable(msg.sender) : m.creator;
+        m.price = price;
+        m.createdAt = block.timestamp;
+        m.expiresAt = 0;
+        m.sold = false;
+        m.isAuction = false;
+        m.category = category;
+        m.collectionId = collectionId;
+        m.acceptsOffers = true;
+        m.minOffer = 0;
+        m.payWith = payWith;
+        m.erc20 = erc20;
 
         emit MarketItemCreated(tokenId, msg.sender, address(0), price, false, category);
     }
 
-    function createMarketSale(uint256 tokenId) public payable nonReentrant validTokenId(tokenId) {
-        uint256 price = idToMarketItem[tokenId].price;
-        address seller = idToMarketItem[tokenId].seller;
-        
-        require(msg.value == price, "Incorrect payment amount");
-        require(!idToMarketItem[tokenId].sold, "Item already sold");
-
-        // Calculate platform fee
-        uint256 platformFeeAmount = (price * platformFee) / 10000;
-        uint256 sellerAmount = price - platformFeeAmount;
-
-        // Transfer payment to seller
-        (bool sellerPaid, ) = seller.call{value: sellerAmount}("");
-        require(sellerPaid, "Payment to seller failed");
-
-        // Store platform fee
-        platformFeeBalance += platformFeeAmount;
-
-        // Transfer token to buyer
-        _transfer(address(this), msg.sender, tokenId);
-        idToMarketItem[tokenId].owner = payable(msg.sender);
-        idToMarketItem[tokenId].sold = true;
-        _itemsSold.increment();
-
-        // Award loyalty points
-        if (loyaltyProgramEnabled) {
-            _awardLoyaltyPoints(msg.sender, price / 1e16, "PURCHASE"); // 1 point per 0.01 ETH
-        }
-
-        emit MarketItemSold(tokenId, seller, msg.sender, price, address(0));
+    function cancelListing(uint256 tokenId) external nonReentrant {
+        MarketItem storage m = idToMarketItem[tokenId];
+        require(m.seller == msg.sender, "Not seller");
+        require(!m.sold, "Already sold");
+        require(!m.isAuction, "Auction active");
+        _transfer(address(this), m.seller, tokenId);
+        delete idToMarketItem[tokenId];
+        emit ListingCancelled(tokenId);
     }
 
-    // ========== MINTING FUNCTIONS ==========
+    function createMarketSale(uint256 tokenId, address referrer) external payable nonReentrant whenNotPaused {
+        MarketItem storage m = idToMarketItem[tokenId];
+        require(!m.sold && !m.isAuction, "Not fixed-price");
+        require(m.price > 0, "Not listed");
+
+        uint256 price = m.price;
+
+        if (m.payWith == PaymentMethod.ETH) {
+            require(msg.value == price, "Incorrect ETH");
+        } else {
+            require(msg.value == 0, "ERC20 purchase is non-ETH");
+            _collectERC20(m.erc20, msg.sender, price);
+        }
+
+        _settleSaleAndTransfer(tokenId, price, referrer, msg.sender);
+
+        emit MarketItemSold(tokenId, m.seller, msg.sender, price, referrer);
+    }
+
+    // Internal settlement (royalties + platform + seller; supports ETH & ERC20)
+    function _settleSaleAndTransfer(
+        uint256 tokenId,
+        uint256 grossAmount,
+        address referrer,
+        address buyer
+    ) internal {
+        MarketItem storage m = idToMarketItem[tokenId];
+
+        // Royalties (ERC2981)
+        (address royaltyRec, uint256 royaltyAmount) = royaltyInfo(tokenId, grossAmount);
+        require(royaltyAmount <= (grossAmount * MAX_ROYALTY) / 10000, "Royalty too high");
+
+        // Platform fee
+        uint256 platformFeeAmount = (grossAmount * platformFee) / 10000;
+
+        // Referral from platform fee
+        uint256 referralCut = 0;
+        if (referrer != address(0) && referrer != m.seller && referrer != buyer) {
+            referralCut = (platformFeeAmount * referralBps) / 10000;
+            referralEarnings[referrer] += referralCut;
+            platformFeeAmount -= referralCut;
+        }
+
+        uint256 sellerAmount = grossAmount - royaltyAmount - platformFeeAmount;
+
+        if (m.payWith == PaymentMethod.ETH) {
+            // Pay royalty
+            if (royaltyAmount > 0 && royaltyRec != address(0)) {
+                (bool okR, ) = payable(royaltyRec).call{value: royaltyAmount}("");
+                require(okR, "Royalty pay failed");
+            }
+            // Pay seller
+            (bool okS, ) = m.seller.call{value: sellerAmount}("");
+            require(okS, "Seller pay failed");
+
+            // Add platform fee balance
+            platformFeeBalance += platformFeeAmount;
+
+            // Referral earnings (held in accounting, owner withdraws separately to referrer)
+            if (referralCut > 0) {
+                // held as accounting; paid when owner pays referrer
+            }
+        } else {
+            // ERC20 flow
+            IERC20 token = IERC20(m.erc20);
+            if (royaltyAmount > 0 && royaltyRec != address(0)) {
+                require(token.transfer(royaltyRec, royaltyAmount), "ERC20 royalty fail");
+            }
+            require(token.transfer(m.seller, sellerAmount), "ERC20 seller fail");
+            // Accrue platform fee into the contract
+            require(token.transfer(address(this), platformFeeAmount), "ERC20 platform fee fail");
+        }
+
+        // Transfer NFT
+        _transfer(address(this), buyer, tokenId);
+
+        // Bookkeeping
+        m.owner = payable(buyer);
+        m.sold = true;
+        _itemsSold.increment();
+
+        // Loyalty points
+        if (loyaltyProgramEnabled) {
+            _awardLoyaltyPoints(buyer, grossAmount / 1e16, "PURCHASE"); // 1 pt per 0.01 ETH (or 0.01 token unit)
+        }
+    }
+
+    // ========== OFFERS (ETH escrow) ==========
+
+    function makeOffer(uint256 tokenId) external payable nonReentrant whenNotPaused {
+        require(msg.value > 0, "Zero offer");
+        MarketItem storage m = idToMarketItem[tokenId];
+        require(!m.sold, "Sold");
+        require(!m.isAuction, "Auction active");
+        require(m.acceptsOffers, "Offers disabled");
+
+        Offer storage current = bestOffer[tokenId];
+        require(msg.value > current.amount, "Offer not higher");
+
+        // refund previous
+        if (current.amount > 0) {
+            (bool ok, ) = payable(current.bidder).call{value: current.amount}("");
+            require(ok, "Refund failed");
+        }
+
+        bestOffer[tokenId] = Offer({bidder: msg.sender, amount: msg.value, createdAt: block.timestamp});
+        emit OfferMade(tokenId, msg.sender, msg.value);
+    }
+
+    function cancelMyOffer(uint256 tokenId) external nonReentrant {
+        Offer storage current = bestOffer[tokenId];
+        require(current.bidder == msg.sender, "Not your offer");
+        uint256 amt = current.amount;
+        delete bestOffer[tokenId];
+        (bool ok, ) = payable(msg.sender).call{value: amt}("");
+        require(ok, "Refund failed");
+        emit OfferCancelled(tokenId, msg.sender, amt);
+    }
+
+    function acceptBestOffer(uint256 tokenId, address referrer) external nonReentrant whenNotPaused {
+        MarketItem storage m = idToMarketItem[tokenId];
+        require(m.seller == msg.sender, "Not seller");
+        Offer storage current = bestOffer[tokenId];
+        require(current.amount > 0, "No offer");
+
+        uint256 offerAmt = current.amount;
+        address bidder = current.bidder;
+        delete bestOffer[tokenId];
+
+        // settle with offer amount
+        _settleSaleAndTransfer(tokenId, offerAmt, referrer, bidder);
+        emit OfferAccepted(tokenId, msg.sender, bidder, offerAmt);
+    }
+
+    // ========== AUCTIONS (English) ==========
+
+    function createAuction(
+        uint256 tokenId,
+        uint256 startPrice,
+        uint256 duration,
+        address referrer
+    ) external nonReentrant validTokenId(tokenId) whenNotPaused {
+        require(duration >= MIN_AUCTION_DURATION, "Duration too short");
+        require(ownerOf(tokenId) == msg.sender, "Not owner");
+        require(!auctions[tokenId].active, "Auction exists");
+
+        _transfer(msg.sender, address(this), tokenId);
+
+        auctions[tokenId] = Auction({
+            active: true,
+            tokenId: tokenId,
+            seller: payable(msg.sender),
+            startPrice: startPrice,
+            highestBid: 0,
+            highestBidder: payable(address(0)),
+            endTime: block.timestamp + duration,
+            referrer: referrer
+        });
+
+        // mark listing state
+        MarketItem storage m = idToMarketItem[tokenId];
+        m.tokenId = tokenId;
+        m.seller = payable(msg.sender);
+        m.isAuction = true;
+
+        emit AuctionCreated(tokenId, startPrice, block.timestamp + duration);
+    }
+
+    function bid(uint256 tokenId) external payable nonReentrant whenNotPaused {
+        Auction storage a = auctions[tokenId];
+        require(a.active, "No auction");
+        require(block.timestamp < a.endTime, "Auction ended");
+        uint256 minNext = a.highestBid == 0 ? a.startPrice : (a.highestBid + ((a.highestBid * 500) / 10000)); // +5%
+        require(msg.value >= minNext, "Bid too low");
+
+        // Refund previous
+        if (a.highestBid > 0) {
+            (bool ok, ) = a.highestBidder.call{value: a.highestBid}("");
+            require(ok, "Refund failed");
+        }
+
+        a.highestBid = msg.value;
+        a.highestBidder = payable(msg.sender);
+
+        // Anti-sniping
+        if (a.endTime - block.timestamp < AUCTION_TIME_EXTENSION) {
+            a.endTime = block.timestamp + AUCTION_TIME_EXTENSION;
+        }
+
+        emit AuctionBid(tokenId, msg.sender, msg.value);
+    }
+
+    function finalizeAuction(uint256 tokenId) external nonReentrant whenNotPaused {
+        Auction storage a = auctions[tokenId];
+        require(a.active, "No auction");
+        require(block.timestamp >= a.endTime, "Not ended");
+
+        a.active = false;
+
+        if (a.highestBid == 0) {
+            // return NFT to seller
+            _transfer(address(this), a.seller, tokenId);
+            delete auctions[tokenId];
+            emit AuctionFinalized(tokenId, address(0), 0);
+            return;
+        }
+
+        uint256 amount = a.highestBid;
+        address winner = a.highestBidder;
+
+        // settle sale (ETH only)
+        _settleSaleAndTransfer(tokenId, amount, a.referrer, winner);
+
+        delete auctions[tokenId];
+        emit AuctionFinalized(tokenId, winner, amount);
+    }
+
+    // ========== MINTING & LAZY MINTING ==========
 
     function mintToken(
-        string memory tokenURI,
-        string memory category,
-        uint256 collectionId
-    ) public returns (uint256) {
+        string calldata tokenURI_,
+        string calldata category,
+        uint256 collectionId,
+        address royaltyReceiver,
+        uint96 royaltyBps
+    ) public whenNotPaused returns (uint256) {
+        require(royaltyBps <= MAX_ROYALTY, "Royalty too high");
         _tokenIds.increment();
         uint256 newTokenId = _tokenIds.current();
 
         _safeMint(msg.sender, newTokenId);
-        _setTokenURI(newTokenId, tokenURI);
+        _setTokenURI(newTokenId, tokenURI_);
+        if (royaltyReceiver != address(0) && royaltyBps > 0) {
+            _setTokenRoyalty(newTokenId, royaltyReceiver, royaltyBps);
+        }
 
-        // Add to user tokens
         userTokens[msg.sender].push(newTokenId);
 
-        // Initialize market item
-        idToMarketItem[newTokenId] = MarketItem({
-            tokenId: newTokenId,
-            seller: payable(address(0)),
-            owner: payable(msg.sender),
-            creator: payable(msg.sender),
-            price: 0,
-            createdAt: block.timestamp,
-            expiresAt: 0,
-            sold: false,
-            isAuction: false,
-            category: category,
-            collectionId: collectionId,
-            views: 0,
-            likes: 0,
-            isExclusive: false,
-            unlockableContentHash: bytes32(0),
-            collaborators: new address[](0),
-            collaboratorShares: new uint256[](0),
-            isLazyMinted: false,
-            editionNumber: 0,
-            totalEditions: 0,
-            acceptsOffers: false,
-            minOffer: 0,
-            isMetaverseEnabled: false,
-            isAIGenerated: false,
-            hasCarbonOffset: false,
-            isMusicNFT: false,
-            isRealEstate: false,
-            isFractional: false,
-            utilityScore: 0,
-            hasDynamicPricing: false,
-            aiPricingId: 0,
-            isGameAsset: false,
-            gameAssetId: 0,
-            isInVirtualGallery: false,
-            galleryIds: new uint256[](0),
-            crossChainEnabled: false,
-            supportedChainIds: new uint256[](0)
-        });
+        MarketItem storage m = idToMarketItem[newTokenId];
+        m.tokenId = newTokenId;
+        m.owner = payable(msg.sender);
+        m.creator = payable(msg.sender);
+        m.category = category;
+        m.collectionId = collectionId;
 
         return newTokenId;
     }
 
-    // ========== VIRTUAL GALLERY FUNCTIONS ==========
+    // EIP-712 Lazy mint
+    struct LazyMintVoucher {
+        uint256 tokenId; // 0 means autoincrement
+        uint256 price;
+        string uri;
+        address creator;
+        uint256 nonce;
+        uint256 expiry;
+        bytes signature;
+    }
+
+    function lazyMint(LazyMintVoucher calldata v, address buyer, address referrer)
+        external
+        payable
+        nonReentrant
+        whenNotPaused
+    {
+        require(block.timestamp <= v.expiry, "Voucher expired");
+        require(v.price > 0, "Price=0");
+
+        bytes32 digest = _hashTypedDataV4(
+            keccak256(abi.encode(_LAZY_MINT_TYPEHASH, v.tokenId, v.price, keccak256(bytes(v.uri)), v.creator, v.nonce, v.expiry))
+        );
+        address signer = ECDSA.recover(digest, v.signature);
+        require(signer == v.creator, "Bad signature");
+
+        // Avoid replay per-creator
+        require(userNonce[v.creator] == v.nonce, "Bad nonce");
+        userNonce[v.creator] += 1;
+
+        if (msg.value != v.price) revert("Incorrect ETH sent");
+
+        // Mint to this contract then settle to buyer
+        uint256 tokenId = v.tokenId;
+        if (tokenId == 0) {
+            _tokenIds.increment();
+            tokenId = _tokenIds.current();
+        }
+        _safeMint(address(this), tokenId);
+        _setTokenURI(tokenId, v.uri);
+
+        // set token creator
+        MarketItem storage m = idToMarketItem[tokenId];
+        m.creator = payable(v.creator);
+        m.tokenId = tokenId;
+        m.seller = payable(v.creator);
+        m.price = v.price;
+
+        // default royalty to creator 5%
+        _setTokenRoyalty(tokenId, v.creator, 500);
+
+        _settleSaleAndTransfer(tokenId, v.price, referrer, buyer);
+        emit MarketItemSold(tokenId, v.creator, buyer, v.price, referrer);
+    }
+
+    // ========== ALLOWLIST MINT (Merkle) ==========
+
+    function setAllowlistRoot(bytes32 root) external onlyOwner {
+        allowlistRoot = root;
+    }
+
+    function allowlistMint(
+        uint256 maxPerWallet,
+        bytes32[] calldata proof,
+        string calldata tokenURI_,
+        uint256 collectionId
+    ) external payable whenNotPaused {
+        require(allowlistRoot != bytes32(0), "Allowlist off");
+        bytes32 leaf = keccak256(abi.encodePacked(msg.sender, maxPerWallet));
+        require(MerkleProof.verify(proof, allowlistRoot, leaf), "Not allowlisted");
+        require(allowlistMinted[msg.sender] < maxPerWallet, "Wallet cap reached");
+        require(msg.value >= listingPrice, "Fee");
+
+        allowlistMinted[msg.sender] += 1;
+        uint256 tokenId = mintToken(tokenURI_, "Art", collectionId, msg.sender, 500);
+        platformFeeBalance += msg.value; // simple mint fee to platform
+        // token goes to msg.sender via mintToken
+    }
+
+    // ========== VIRTUAL GALLERY ==========
 
     function createVirtualGallery(
-        string memory name,
-        string memory description,
+        string calldata name,
+        string calldata description,
         GalleryTheme theme,
         bool isPublic,
         uint256 entryFee
     ) external payable returns (uint256) {
-        require(virtualGalleriesEnabled, "Virtual galleries disabled");
+        require(virtualGalleriesEnabled, "Galleries disabled");
         require(msg.value >= VIRTUAL_GALLERY_FEE, "Insufficient fee");
-        require(bytes(name).length > 0, "Name cannot be empty");
+        require(bytes(name).length > 0, "Name empty");
 
         _virtualGalleryIds.increment();
         uint256 galleryId = _virtualGalleryIds.current();
 
-        VirtualGallery storage gallery = idToVirtualGallery[galleryId];
-        gallery.galleryId = galleryId;
-        gallery.name = name;
-        gallery.description = description;
-        gallery.owner = msg.sender;
-        gallery.createdAt = block.timestamp;
-        gallery.theme = theme;
-        gallery.isPublic = isPublic;
-        gallery.entryFee = entryFee;
-        gallery.totalVisits = 0;
-        gallery.isActive = true;
+        VirtualGallery storage g = idToVirtualGallery[galleryId];
+        g.galleryId = galleryId;
+        g.name = name;
+        g.description = description;
+        g.owner = msg.sender;
+        g.createdAt = block.timestamp;
+        g.theme = theme;
+        g.isPublic = isPublic;
+        g.entryFee = entryFee;
+        g.totalVisits = 0;
+        g.isActive = true;
 
         userVirtualGalleries[msg.sender].push(galleryId);
         platformFeeBalance += msg.value;
@@ -585,66 +910,67 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     }
 
     function visitVirtualGallery(uint256 galleryId) external payable {
-        VirtualGallery storage gallery = idToVirtualGallery[galleryId];
-        require(gallery.isActive, "Gallery not active");
-        
-        if (!gallery.isPublic) {
-            require(gallery.vipAccess[msg.sender] || msg.value >= gallery.entryFee, 
-                   "Access denied or insufficient entry fee");
+        VirtualGallery storage g = idToVirtualGallery[galleryId];
+        require(g.isActive, "Inactive");
+
+        if (!g.isPublic) {
+            require(g.vipAccess[msg.sender] || msg.value >= g.entryFee, "No VIP or fee");
         }
 
-        gallery.totalVisits++;
-        gallery.visitHistory[msg.sender] = block.timestamp;
+        g.totalVisits++;
+        g.visitHistory[msg.sender] = block.timestamp;
 
         if (msg.value > 0) {
-            // Transfer entry fee to gallery owner
-            (bool sent, ) = gallery.owner.call{value: msg.value}("");
-            require(sent, "Fee transfer failed");
+            (bool sent, ) = g.owner.call{value: msg.value}("");
+            require(sent, "Fee xfer fail");
         }
 
         emit VirtualGalleryVisited(galleryId, msg.sender, block.timestamp);
     }
 
-    function exhibitTokenInGallery(uint256 galleryId, uint256 tokenId) 
-        external onlyGalleryOwner(galleryId) validTokenId(tokenId) {
-        
-        VirtualGallery storage gallery = idToVirtualGallery[galleryId];
-        require(gallery.isActive, "Gallery not active");
+    function exhibitTokenInGallery(uint256 galleryId, uint256 tokenId)
+        external
+        onlyGalleryOwner(galleryId)
+        validTokenId(tokenId)
+    {
+        VirtualGallery storage g = idToVirtualGallery[galleryId];
+        require(g.isActive, "Inactive");
+        g.exhibitedTokenIds.push(tokenId);
 
-        gallery.exhibitedTokenIds.push(tokenId);
-        idToMarketItem[tokenId].isInVirtualGallery = true;
-        idToMarketItem[tokenId].galleryIds.push(galleryId);
+        MarketItem storage m = idToMarketItem[tokenId];
+        m.isInVirtualGallery = true;
+        m.galleryIds.push(galleryId);
 
         emit TokenExhibited(galleryId, tokenId, msg.sender);
     }
 
-    // ========== AI ART GENERATION FUNCTIONS ==========
+    // ========== AI ART ==========
 
-    function requestAIArtGeneration(
-        string memory prompt,
-        string memory style
-    ) external payable validAIGenerationRequest(prompt, style) returns (uint256) {
-        require(aiArtGenerationEnabled, "AI art generation disabled");
-        require(msg.value >= AI_GENERATION_FEE, "Insufficient generation fee");
+    function requestAIArtGeneration(string calldata prompt, string calldata style)
+        external
+        payable
+        validAIGenerationRequest(prompt, style)
+        returns (uint256)
+    {
+        require(aiArtGenerationEnabled, "AI gen disabled");
+        require(msg.value >= AI_GENERATION_FEE, "Fee");
 
         _aiArtIds.increment();
         uint256 aiArtId = _aiArtIds.current();
 
-        AIArtGeneration storage generation = idToAIArtGeneration[aiArtId];
-        generation.aiArtId = aiArtId;
-        generation.requester = msg.sender;
-        generation.prompt = prompt;
-        generation.style = style;
-        generation.requestedAt = block.timestamp;
-        generation.generationCost = msg.value;
-        generation.isCompleted = false;
-        generation.isMinted = false;
-        generation.qualityScore = 0;
-        generation.isPublic = true;
+        AIArtGeneration storage gen = idToAIArtGeneration[aiArtId];
+        gen.aiArtId = aiArtId;
+        gen.requester = msg.sender;
+        gen.prompt = prompt;
+        gen.style = style;
+        gen.requestedAt = block.timestamp;
+        gen.generationCost = msg.value;
+        gen.isCompleted = false;
+        gen.isMinted = false;
+        gen.qualityScore = 0;
+        gen.isPublic = true;
 
-        // Increment daily generation count
         userAIGenerations[msg.sender][today()]++;
-
         platformFeeBalance += msg.value;
 
         emit AIArtRequested(aiArtId, msg.sender, prompt, style);
@@ -653,45 +979,50 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
 
     function completeAIArtGeneration(
         uint256 aiArtId,
-        string memory resultURI,
+        string calldata resultURI,
         uint256 qualityScore
     ) external onlyOwner {
-        AIArtGeneration storage generation = idToAIArtGeneration[aiArtId];
-        require(!generation.isCompleted, "Already completed");
-        require(qualityScore <= 100, "Invalid quality score");
+        AIArtGeneration storage gen = idToAIArtGeneration[aiArtId];
+        require(!gen.isCompleted, "Completed");
+        require(qualityScore <= 100, "Bad score");
 
-        generation.resultURI = resultURI;
-        generation.completedAt = block.timestamp;
-        generation.isCompleted = true;
-        generation.qualityScore = qualityScore;
+        gen.resultURI = resultURI;
+        gen.completedAt = block.timestamp;
+        gen.isCompleted = true;
+        gen.qualityScore = qualityScore;
 
-        // Auto-mint if quality score is high enough
-        if (qualityScore >= 70 && !generation.isMinted) {
-            uint256 tokenId = mintToken(resultURI, "Art", 0);
-            idToMarketItem[tokenId].isAIGenerated = true;
-            generation.isMinted = true;
-            
-            // Transfer to requester
-            _transfer(address(this), generation.requester, tokenId);
-            
+        if (qualityScore >= 70 && !gen.isMinted) {
+            // mint to requester
+            _tokenIds.increment();
+            uint256 tokenId = _tokenIds.current();
+            _safeMint(gen.requester, tokenId);
+            _setTokenURI(tokenId, resultURI);
+
+            MarketItem storage m = idToMarketItem[tokenId];
+            m.tokenId = tokenId;
+            m.owner = payable(gen.requester);
+            m.creator = payable(address(this));
+            m.isAIGenerated = true;
+
+            gen.isMinted = true;
             emit AIArtGenerated(aiArtId, tokenId, resultURI);
         }
     }
 
-    // ========== SUBSCRIPTION FUNCTIONS ==========
+    // ========== SUBSCRIPTIONS ==========
 
     function activateSubscription(uint256 tierId) external payable {
         SubscriptionTier memory tier = subscriptionTiers[tierId];
-        require(tier.isActive, "Subscription tier not active");
-        require(msg.value >= tier.monthlyFee, "Insufficient payment");
+        require(tier.isActive, "Tier inactive");
+        require(msg.value >= tier.monthlyFee, "Insufficient");
 
-        UserSubscription storage subscription = userSubscriptions[msg.sender];
-        subscription.tierId = tierId;
-        subscription.startTime = block.timestamp;
-        subscription.endTime = block.timestamp + SUBSCRIPTION_DURATION;
-        subscription.isActive = true;
-        subscription.currentTier = tier.level;
-        subscription.totalSpent += msg.value;
+        UserSubscription storage s = userSubscriptions[msg.sender];
+        s.tierId = tierId;
+        s.startTime = block.timestamp;
+        s.endTime = block.timestamp + SUBSCRIPTION_DURATION;
+        s.isActive = true;
+        s.currentTier = tier.level;
+        s.totalSpent += msg.value;
 
         platformFeeBalance += msg.value;
 
@@ -699,41 +1030,189 @@ contract NFTMarketplace is ERC721URIStorage, ReentrancyGuard, Ownable, Pausable,
     }
 
     function renewSubscription() external payable {
-        UserSubscription storage subscription = userSubscriptions[msg.sender];
-        require(subscription.isActive, "No active subscription");
-        
-        SubscriptionTier memory tier = subscriptionTiers[subscription.tierId];
-        require(msg.value >= tier.monthlyFee, "Insufficient payment");
+        UserSubscription storage s = userSubscriptions[msg.sender];
+        require(s.isActive, "Inactive");
 
-        subscription.endTime += SUBSCRIPTION_DURATION;
-        subscription.totalSpent += msg.value;
+        SubscriptionTier memory tier = subscriptionTiers[s.tierId];
+        require(msg.value >= tier.monthlyFee, "Insufficient");
+
+        s.endTime += SUBSCRIPTION_DURATION;
+        s.totalSpent += msg.value;
 
         platformFeeBalance += msg.value;
-
-        emit SubscriptionRenewed(msg.sender, subscription.tierId, subscription.endTime);
+        emit SubscriptionRenewed(msg.sender, s.tierId, s.endTime);
     }
 
-    // ========== LOYALTY PROGRAM FUNCTIONS ==========
+    // ========== LOYALTY PROGRAMS ==========
 
     function _awardLoyaltyPoints(address user, uint256 points, string memory action) internal {
         if (!loyaltyProgramEnabled) return;
 
-        LoyaltyMember storage member = loyaltyMembers[user];
-        if (!member.isActive) {
-            member.memberAddress = user;
-            member.joinedAt = block.timestamp;
-            member.isActive = true;
+        LoyaltyMember storage m = loyaltyMembers[user];
+        if (!m.isActive) {
+            m.memberAddress = user;
+            m.joinedAt = block.timestamp;
+            m.isActive = true;
             loyaltyPrograms[defaultLoyaltyProgramId].totalMembers++;
         }
 
-        member.totalPoints += points;
-        member.lastActivityAt = block.timestamp;
-
+        m.totalPoints += points;
+        m.lastActivityAt = block.timestamp;
         emit LoyaltyPointsEarned(user, points, action);
     }
 
-    function claimLoyaltyReward(string memory rewardName, uint256 pointsCost) external {
-        require(loyaltyProgramEnabled, "Loyalty program disabled");
-        
-        LoyaltyMember storage member = loyaltyMembers[msg.sender];
-        require(member.isActive,
+    function claimLoyaltyReward(string calldata rewardName, uint256 pointsCost) external nonReentrant {
+        require(loyaltyProgramEnabled, "Disabled");
+        LoyaltyMember storage m = loyaltyMembers[msg.sender];
+        require(m.isActive && m.totalPoints >= pointsCost, "Not enough points");
+
+        m.totalPoints -= pointsCost;
+
+        // simple ETH cashback from platform pool based on program rate (scaled 1e18)
+        uint256 rate = loyaltyPrograms[defaultLoyaltyProgramId].pointsToEtherRate; // e.g., 5e15 => 0.005 ETH per 1,000 pts if multiplied accordingly
+        uint256 rebate = (pointsCost * rate) / 1e18;
+        if (rebate > 0 && address(this).balance >= rebate && platformFeeBalance >= rebate) {
+            platformFeeBalance -= rebate;
+            (bool ok, ) = payable(msg.sender).call{value: rebate}("");
+            require(ok, "Rebate transfer failed");
+        }
+
+        emit LoyaltyRewardClaimed(msg.sender, rewardName, pointsCost);
+    }
+
+    // ========== ADMIN / CONFIG ==========
+
+    function setPlatformFee(uint256 bps) external onlyOwner {
+        require(bps <= MAX_PLATFORM_FEE, "Fee too high");
+        platformFee = bps;
+    }
+
+    function setReferralBps(uint256 bps) external onlyOwner {
+        require(bps <= 5000, "Max 50% of platform fee");
+        referralBps = bps;
+    }
+
+    function setListingPrice(uint256 priceWei) external onlyOwner {
+        listingPrice = priceWei;
+    }
+
+    function setDefaultRoyalty(address receiver, uint96 bps) external onlyOwner {
+        require(bps <= MAX_ROYALTY, "Royalty too high");
+        _setDefaultRoyalty(receiver, bps);
+    }
+
+    function allowERC20(address token, bool allowed) external onlyOwner {
+        allowedERC20[token] = allowed;
+    }
+
+    function setAIPricingOracle(address oracle, bool authorize) external onlyOwner {
+        aiPricingOracle = oracle;
+        authorizedAIOracles[oracle] = authorize;
+    }
+
+    function withdrawPlatformFees(address payable to, uint256 amount) external onlyOwner {
+        require(amount <= platformFeeBalance, "Exceeds balance");
+        platformFeeBalance -= amount;
+        (bool ok, ) = to.call{value: amount}("");
+        require(ok, "Withdraw fail");
+    }
+
+    function payReferral(address payable referrer, uint256 amount) external onlyOwner {
+        require(referralEarnings[referrer] >= amount, "Insufficient earned");
+        referralEarnings[referrer] -= amount;
+        (bool ok, ) = referrer.call{value: amount}("");
+        require(ok, "Referral pay fail");
+    }
+
+    function rescueETH(address payable to, uint256 amount) external onlyOwner {
+        (bool ok, ) = to.call{value: amount}("");
+        require(ok, "Rescue fail");
+    }
+
+    function rescueERC20(address token, address to, uint256 amount) external onlyOwner {
+        require(IERC20(token).transfer(to, amount), "Rescue ERC20 fail");
+    }
+
+    function pause() external onlyOwner { _pause(); }
+    function unpause() external onlyOwner { _unpause(); }
+
+    // ========== HELPERS ==========
+
+    function today() internal view returns (uint256) {
+        return block.timestamp / 1 days;
+    }
+
+    function _createDefaultLoyaltyProgram() internal {
+        _loyaltyProgramIds.increment();
+        uint256 id = _loyaltyProgramIds.current();
+        loyaltyPrograms[id] = LoyaltyProgram({
+            programId: id,
+            name: "Default",
+            isActive: true,
+            totalMembers: 0,
+            pointsToEtherRate: 5e13 // 0.00005 ETH per 1,000 pts (example: scale 1e18 => tune off-chain)
+        });
+        defaultLoyaltyProgramId = id;
+    }
+
+    function _createDefaultSubscriptionTiers() internal {
+        _subscriptionTierIds.increment();
+        subscriptionTiers[1] = SubscriptionTier({
+            tierId: 1,
+            name: "Basic",
+            monthlyFee: 0,
+            level: SubscriptionTierLevel.Basic,
+            maxListings: 10,
+            maxAIGenerations: 5,
+            enablePrioritySupport: false,
+            enableAnalytics: false,
+            enableCustomGalleries: false,
+            enableCrossChain: false,
+            discountPercentage: 0,
+            isActive: true
+        });
+
+        _subscriptionTierIds.increment();
+        subscriptionTiers[2] = SubscriptionTier({
+            tierId: 2,
+            name: "Premium",
+            monthlyFee: PREMIUM_SUBSCRIPTION_FEE,
+            level: SubscriptionTierLevel.Premium,
+            maxListings: 100,
+            maxAIGenerations: 50,
+            enablePrioritySupport: true,
+            enableAnalytics: true,
+            enableCustomGalleries: true,
+            enableCrossChain: true,
+            discountPercentage: 500, // 5%
+            isActive: true
+        });
+    }
+
+    function _collectERC20(address token, address from, uint256 amount) internal {
+        require(allowedERC20[token], "ERC20 not allowed");
+        require(IERC20(token).transferFrom(from, address(this), amount), "ERC20 transferFrom fail");
+    }
+
+    // ========== OVERRIDES ==========
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(ERC721, ERC2981)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+
+    // Enable OZ upgrades if needed later (no storage changes beyond OZ)
+    // function _beforeTokenTransfer(address from, address to, uint256 tokenId, uint256 batchSize)
+    //     internal
+    //     override(ERC721)
+    // {
+    //     super._beforeTokenTransfer(from, to, tokenId, batchSize);
+    // }
+
+    // Receive ETH
+    receive() external payable {}
+}

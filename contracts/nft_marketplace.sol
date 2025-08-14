@@ -141,8 +141,8 @@ contract NFTMarketplace is
         uint256[] galleryIds;
         bool crossChainEnabled;
         uint256[] supportedChainIds;
-        PaymentMethod payWith; // NEW
-        address erc20; // NEW: optional ERC20 address if payWith == ERC20
+        PaymentMethod payWith;
+        address erc20;
     }
 
     struct Collection {
@@ -206,7 +206,7 @@ contract NFTMarketplace is
         bool enableAnalytics;
         bool enableCustomGalleries;
         bool enableCrossChain;
-        uint256 discountPercentage;
+        uint256 discountPercentage; // used for platform fee discount on seller side
         bool isActive;
     }
 
@@ -289,7 +289,7 @@ contract NFTMarketplace is
         uint256 createdAt;
     }
 
-    // Auctions
+    // Auctions (English)
     struct Auction {
         bool active;
         uint256 tokenId;
@@ -299,6 +299,20 @@ contract NFTMarketplace is
         address payable highestBidder;
         uint256 endTime;
         address referrer;
+    }
+
+    // ───── NEW: Dutch Auction ─────
+    struct DutchAuction {
+        bool active;
+        uint256 tokenId;
+        address payable seller;
+        uint256 startPrice;
+        uint256 endPrice;
+        uint256 startTime;
+        uint256 duration;
+        address referrer;
+        PaymentMethod payWith;
+        address erc20; // optional ERC20 for payment
     }
 
     // ========== EIP-712 TYPE HASHES ==========
@@ -341,6 +355,9 @@ contract NFTMarketplace is
     // Offers and auctions
     mapping(uint256 => Offer) public bestOffer; // tokenId => best offer
     mapping(uint256 => Auction) public auctions; // tokenId => auction
+
+    // ───── NEW: Dutch Auctions mapping ─────
+    mapping(uint256 => DutchAuction) public dutchAuctions; // tokenId => dutch auction
 
     // Allowlist
     bytes32 public allowlistRoot;
@@ -400,6 +417,14 @@ contract NFTMarketplace is
     event DynamicPricingEnabled(uint256 indexed tokenId, uint256 basePrice, PricingType strategy);
     event AIPriceUpdated(uint256 indexed tokenId, uint256 oldPrice, uint256 newPrice, uint256 confidence, string reason);
     event CollectionCreated(uint256 indexed collectionId, string name, address indexed creator);
+
+    // ───── NEW events ─────
+    event ListingUpdated(uint256 indexed tokenId, uint256 newPrice, PaymentMethod payWith, address erc20, bool acceptsOffers, uint256 minOffer);
+    event DutchAuctionCreated(uint256 indexed tokenId, uint256 startPrice, uint256 endPrice, uint256 startTime, uint256 duration);
+    event DutchAuctionPurchased(uint256 indexed tokenId, address buyer, uint256 price, address indexed referrer);
+    event AuctionCancelled(uint256 indexed tokenId);
+    event CategoryUpdated(string category, bool isValid);
+    event CollectionRoyaltyUpdated(uint256 indexed collectionId, address receiver, uint96 bps);
 
     // ========== MODIFIERS ==========
     modifier onlyTokenOwner(uint256 tokenId) {
@@ -537,6 +562,50 @@ contract NFTMarketplace is
         emit MarketItemCreated(tokenId, msg.sender, address(0), price, false, category);
     }
 
+    // ───── NEW: create listing with expiry ─────
+    function createMarketItemWithExpiry(
+        uint256 tokenId,
+        uint256 price,
+        string calldata category,
+        uint256 collectionId,
+        PaymentMethod payWith,
+        address erc20,
+        uint256 expiresAt
+    ) external nonReentrant validTokenId(tokenId) whenNotPaused {
+        createMarketItem(tokenId, price, category, collectionId, payWith, erc20);
+        idToMarketItem[tokenId].expiresAt = expiresAt;
+    }
+
+    // ───── NEW: update listing fields ─────
+    function updateListing(
+        uint256 tokenId,
+        uint256 newPrice,
+        PaymentMethod payWith,
+        address erc20,
+        bool acceptsOffers,
+        uint256 minOffer
+    ) external nonReentrant {
+        MarketItem storage m = idToMarketItem[tokenId];
+        require(m.seller == msg.sender, "Not seller");
+        require(!m.sold, "Already sold");
+        require(!m.isAuction, "Auction active");
+        require(newPrice > 0, "Price must be > 0");
+
+        if (payWith == PaymentMethod.ERC20) {
+            require(allowedERC20[erc20], "ERC20 not allowed");
+        } else {
+            require(erc20 == address(0), "ETH listing requires erc20=0");
+        }
+
+        m.price = newPrice;
+        m.payWith = payWith;
+        m.erc20 = erc20;
+        m.acceptsOffers = acceptsOffers;
+        m.minOffer = minOffer;
+
+        emit ListingUpdated(tokenId, newPrice, payWith, erc20, acceptsOffers, minOffer);
+    }
+
     function cancelListing(uint256 tokenId) external nonReentrant {
         MarketItem storage m = idToMarketItem[tokenId];
         require(m.seller == msg.sender, "Not seller");
@@ -551,6 +620,9 @@ contract NFTMarketplace is
         MarketItem storage m = idToMarketItem[tokenId];
         require(!m.sold && !m.isAuction, "Not fixed-price");
         require(m.price > 0, "Not listed");
+        if (m.expiresAt != 0) {
+            require(block.timestamp <= m.expiresAt, "Listing expired");
+        }
 
         uint256 price = m.price;
 
@@ -579,8 +651,17 @@ contract NFTMarketplace is
         (address royaltyRec, uint256 royaltyAmount) = royaltyInfo(tokenId, grossAmount);
         require(royaltyAmount <= (grossAmount * MAX_ROYALTY) / 10000, "Royalty too high");
 
-        // Platform fee
+        // Platform fee (with seller subscription discount) // NEW
         uint256 platformFeeAmount = (grossAmount * platformFee) / 10000;
+        UserSubscription memory s = userSubscriptions[m.seller];
+        if (s.isActive) {
+            uint256 discountBps = subscriptionTiers[s.tierId].discountPercentage;
+            if (discountBps > 0) {
+                uint256 discount = (platformFeeAmount * discountBps) / 10000;
+                if (discount > platformFeeAmount) discount = platformFeeAmount;
+                platformFeeAmount -= discount;
+            }
+        }
 
         // Referral from platform fee
         uint256 referralCut = 0;
@@ -605,10 +686,7 @@ contract NFTMarketplace is
             // Add platform fee balance
             platformFeeBalance += platformFeeAmount;
 
-            // Referral earnings (held in accounting, owner withdraws separately to referrer)
-            if (referralCut > 0) {
-                // held as accounting; paid when owner pays referrer
-            }
+            // Referral earnings are accounted; owner pays via payReferral
         } else {
             // ERC20 flow
             IERC20 token = IERC20(m.erc20);
@@ -642,6 +720,7 @@ contract NFTMarketplace is
         require(!m.sold, "Sold");
         require(!m.isAuction, "Auction active");
         require(m.acceptsOffers, "Offers disabled");
+        require(msg.value >= m.minOffer, "Below min offer");
 
         Offer storage current = bestOffer[tokenId];
         require(msg.value > current.amount, "Offer not higher");
@@ -692,6 +771,7 @@ contract NFTMarketplace is
         require(duration >= MIN_AUCTION_DURATION, "Duration too short");
         require(ownerOf(tokenId) == msg.sender, "Not owner");
         require(!auctions[tokenId].active, "Auction exists");
+        require(!dutchAuctions[tokenId].active, "Dutch auction exists");
 
         _transfer(msg.sender, address(this), tokenId);
 
@@ -750,6 +830,7 @@ contract NFTMarketplace is
             // return NFT to seller
             _transfer(address(this), a.seller, tokenId);
             delete auctions[tokenId];
+            idToMarketItem[tokenId].isAuction = false;
             emit AuctionFinalized(tokenId, address(0), 0);
             return;
         }
@@ -761,7 +842,95 @@ contract NFTMarketplace is
         _settleSaleAndTransfer(tokenId, amount, a.referrer, winner);
 
         delete auctions[tokenId];
+        idToMarketItem[tokenId].isAuction = false;
         emit AuctionFinalized(tokenId, winner, amount);
+    }
+
+    // ───── NEW: cancel English auction if no bids ─────
+    function cancelAuctionNoBids(uint256 tokenId) external nonReentrant {
+        Auction storage a = auctions[tokenId];
+        require(a.active, "No auction");
+        require(a.seller == msg.sender, "Not seller");
+        require(a.highestBid == 0, "Already has bids");
+        a.active = false;
+        _transfer(address(this), a.seller, tokenId);
+        delete auctions[tokenId];
+        idToMarketItem[tokenId].isAuction = false;
+        emit AuctionCancelled(tokenId);
+    }
+
+    // ========== DUTCH AUCTIONS (NEW) ==========
+    function createDutchAuction(
+        uint256 tokenId,
+        uint256 startPrice,
+        uint256 endPrice,
+        uint256 duration,
+        address referrer,
+        PaymentMethod payWith,
+        address erc20
+    ) external nonReentrant validTokenId(tokenId) whenNotPaused {
+        require(ownerOf(tokenId) == msg.sender, "Not owner");
+        require(!auctions[tokenId].active, "English auction exists");
+        require(!dutchAuctions[tokenId].active, "Dutch exists");
+        require(duration >= MIN_AUCTION_DURATION, "Duration too short");
+        require(startPrice > endPrice, "startPrice must > endPrice");
+        if (payWith == PaymentMethod.ERC20) {
+            require(allowedERC20[erc20], "ERC20 not allowed");
+        } else {
+            require(erc20 == address(0), "ETH auction requires erc20=0");
+        }
+
+        _transfer(msg.sender, address(this), tokenId);
+
+        dutchAuctions[tokenId] = DutchAuction({
+            active: true,
+            tokenId: tokenId,
+            seller: payable(msg.sender),
+            startPrice: startPrice,
+            endPrice: endPrice,
+            startTime: block.timestamp,
+            duration: duration,
+            referrer: referrer,
+            payWith: payWith,
+            erc20: erc20
+        });
+
+        emit DutchAuctionCreated(tokenId, startPrice, endPrice, block.timestamp, duration);
+    }
+
+    function currentDutchPrice(uint256 tokenId) public view returns (uint256) {
+        DutchAuction memory d = dutchAuctions[tokenId];
+        require(d.active, "No Dutch auction");
+        if (block.timestamp >= d.startTime + d.duration) return d.endPrice;
+        uint256 elapsed = block.timestamp - d.startTime;
+        uint256 priceDrop = ((d.startPrice - d.endPrice) * elapsed) / d.duration;
+        return d.startPrice - priceDrop;
+    }
+
+    function buyDutchAuction(uint256 tokenId) external payable nonReentrant whenNotPaused {
+        DutchAuction storage d = dutchAuctions[tokenId];
+        require(d.active, "No Dutch auction");
+        uint256 price = currentDutchPrice(tokenId);
+
+        if (d.payWith == PaymentMethod.ETH) {
+            require(msg.value == price, "Incorrect ETH");
+        } else {
+            require(msg.value == 0, "ERC20 purchase is non-ETH");
+            _collectERC20(d.erc20, msg.sender, price);
+        }
+
+        // Prepare MarketItem scaffold for settlement
+        MarketItem storage m = idToMarketItem[tokenId];
+        m.tokenId = tokenId;
+        m.seller = d.seller;
+        m.payWith = d.payWith;
+        m.erc20 = d.erc20;
+
+        // settle & transfer
+        _settleSaleAndTransfer(tokenId, price, d.referrer, msg.sender);
+
+        delete dutchAuctions[tokenId];
+        emit DutchAuctionPurchased(tokenId, msg.sender, price, d.referrer);
     }
 
     // ========== MINTING & LAZY MINTING ==========
@@ -774,6 +943,22 @@ contract NFTMarketplace is
         uint96 royaltyBps
     ) public whenNotPaused returns (uint256) {
         require(royaltyBps <= MAX_ROYALTY, "Royalty too high");
+
+        // ───── NEW: enforce collection supply & default royalty ─────
+        if (collectionId != 0) {
+            Collection storage col = idToCollection[collectionId];
+            require(col.isActive, "Collection inactive");
+            require(col.creator != address(0), "Collection not found");
+            require(col.totalSupply < col.maxSupply, "Max supply reached");
+            col.totalSupply += 1;
+
+            // If caller didn't pass a royalty receiver, apply collection default
+            if (royaltyReceiver == address(0) && col.royaltyReceiver != address(0) && col.royaltyBps > 0) {
+                royaltyReceiver = col.royaltyReceiver;
+                royaltyBps = col.royaltyBps;
+            }
+        }
+
         _tokenIds.increment();
         uint256 newTokenId = _tokenIds.current();
 
@@ -793,6 +978,21 @@ contract NFTMarketplace is
         m.collectionId = collectionId;
 
         return newTokenId;
+    }
+
+    // ───── NEW: batch minting helper ─────
+    function batchMintToken(
+        string[] calldata tokenURIs,
+        string calldata category,
+        uint256 collectionId,
+        address royaltyReceiver,
+        uint96 royaltyBps
+    ) external whenNotPaused returns (uint256[] memory mintedIds) {
+        require(tokenURIs.length > 0, "No URIs");
+        mintedIds = new uint256[](tokenURIs.length);
+        for (uint256 i = 0; i < tokenURIs.length; i++) {
+            mintedIds[i] = mintToken(tokenURIs[i], category, collectionId, royaltyReceiver, royaltyBps);
+        }
     }
 
     // EIP-712 Lazy mint
@@ -1080,6 +1280,55 @@ contract NFTMarketplace is
         emit LoyaltyRewardClaimed(msg.sender, rewardName, pointsCost);
     }
 
+    // ========== COLLECTIONS (NEW) ==========
+
+    function createCollection(
+        string calldata name,
+        string calldata description,
+        uint256 maxSupply,
+        uint96 royaltyBps,
+        address royaltyReceiver,
+        string calldata logoURI,
+        string calldata bannerURI
+    ) external returns (uint256) {
+        require(bytes(name).length > 0, "Name empty");
+        require(maxSupply > 0, "maxSupply=0");
+        require(royaltyBps <= MAX_ROYALTY, "Royalty too high");
+
+        _collectionIds.increment();
+        uint256 collectionId = _collectionIds.current();
+
+        idToCollection[collectionId] = Collection({
+            collectionId: collectionId,
+            name: name,
+            description: description,
+            creator: msg.sender,
+            totalSupply: 0,
+            maxSupply: maxSupply,
+            royaltyBps: royaltyBps,
+            royaltyReceiver: royaltyReceiver,
+            isVerified: false,
+            logoURI: logoURI,
+            bannerURI: bannerURI,
+            floorPrice: 0,
+            totalVolume: 0,
+            isActive: true
+        });
+
+        emit CollectionCreated(collectionId, name, msg.sender);
+        return collectionId;
+    }
+
+    function setCollectionRoyalty(uint256 collectionId, address receiver, uint96 bps) external {
+        Collection storage col = idToCollection[collectionId];
+        require(col.creator == msg.sender || msg.sender == owner(), "Not collection owner");
+        require(col.isActive, "Collection inactive");
+        require(bps <= MAX_ROYALTY, "Royalty too high");
+        col.royaltyReceiver = receiver;
+        col.royaltyBps = bps;
+        emit CollectionRoyaltyUpdated(collectionId, receiver, bps);
+    }
+
     // ========== ADMIN / CONFIG ==========
 
     function setPlatformFee(uint256 bps) external onlyOwner {
@@ -1117,6 +1366,11 @@ contract NFTMarketplace is
         require(ok, "Withdraw fail");
     }
 
+    // ───── NEW: withdraw ERC20 platform fees (any allowed token) ─────
+    function withdrawERC20PlatformFees(address token, address to, uint256 amount) external onlyOwner {
+        require(IERC20(token).transfer(to, amount), "ERC20 withdraw fail");
+    }
+
     function payReferral(address payable referrer, uint256 amount) external onlyOwner {
         require(referralEarnings[referrer] >= amount, "Insufficient earned");
         referralEarnings[referrer] -= amount;
@@ -1136,6 +1390,12 @@ contract NFTMarketplace is
     function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
 
+    // ───── NEW: manage categories ─────
+    function setCategory(string calldata category, bool isValid) external onlyOwner {
+        validCategories[category] = isValid;
+        emit CategoryUpdated(category, isValid);
+    }
+
     // ========== HELPERS ==========
 
     function today() internal view returns (uint256) {
@@ -1150,7 +1410,7 @@ contract NFTMarketplace is
             name: "Default",
             isActive: true,
             totalMembers: 0,
-            pointsToEtherRate: 5e13 // 0.00005 ETH per 1,000 pts (example: scale 1e18 => tune off-chain)
+            pointsToEtherRate: 5e13 // 0.00005 ETH per 1,000 pts (example)
         });
         defaultLoyaltyProgramId = id;
     }
@@ -1204,14 +1464,6 @@ contract NFTMarketplace is
     {
         return super.supportsInterface(interfaceId);
     }
-
-    // Enable OZ upgrades if needed later (no storage changes beyond OZ)
-    // function _beforeTokenTransfer(address from, address to, uint256 tokenId, uint256 batchSize)
-    //     internal
-    //     override(ERC721)
-    // {
-    //     super._beforeTokenTransfer(from, to, tokenId, batchSize);
-    // }
 
     // Receive ETH
     receive() external payable {}
